@@ -7,15 +7,16 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 2 — repository ingestion. Projects can be imported from GitHub or a ZIP file
-> and their source files are scanned; analysis features are built incrementally (see [Roadmap](#roadmap)).
+> **Status:** Phase 3 — Tree-sitter integration. Projects can be imported from GitHub or a ZIP file,
+> their source files are scanned, and each file can be parsed into a syntax tree; analysis features
+> are built incrementally (see [Roadmap](#roadmap)).
 
 ## Tech stack
 
 | Layer          | Technology                                   |
 | -------------- | -------------------------------------------- |
 | Backend        | Python 3.11+, FastAPI, Pydantic              |
-| Code analysis  | Tree-sitter *(Phase 3)*                      |
+| Code analysis  | Tree-sitter (official grammar packages)      |
 | Knowledge graph| Neo4j *(Phase 6)*                            |
 | Vector search  | Qdrant + open-source embeddings *(Phase 8)*  |
 | LLM            | Provider-agnostic `LLMProvider` *(Phase 10)* |
@@ -93,6 +94,27 @@ curl -X POST http://localhost:8000/projects/zip -F "file=@my-project.zip"
 The easiest way to try them is the interactive docs at <http://localhost:8000/docs>.
 Imported projects are stored in `backend/workspace/<project_id>/` (ignored by Git).
 
+### Parsing source files (Python API)
+
+The parsing layer is not exposed over HTTP yet; later phases use it internally:
+
+```python
+from pathlib import Path
+from app.ingestion.scanner import scan_directory
+from app.parsing.service import ParserService
+
+source_dir = Path("workspace/<project_id>/source")
+service = ParserService(max_file_bytes=1024 * 1024)
+report = service.parse_files(source_dir, scan_directory(source_dir, 1024 * 1024).files)
+
+for result in report.results:
+    print(result.path, result.language, result.root_info.type, result.has_syntax_errors)
+    for error in result.syntax_errors:
+        print("   ", error.message)
+for failure in report.failures:
+    print("skipped", failure.path, failure.reason)
+```
+
 ### Frontend
 
 ```bash
@@ -122,7 +144,7 @@ Git; each app has a committed `.env.example` template.
 |                         | `MAX_EXTRACTED_SIZE_MB` | `500`            | Maximum size after extraction     |
 |                         | `MAX_ARCHIVE_FILES` | `20000`              | Maximum number of entries in a ZIP |
 |                         | `MAX_REPOSITORY_SIZE_MB` | `500`           | Maximum size of a cloned repository |
-|                         | `MAX_SOURCE_FILE_KB` | `1024`              | Larger source files are skipped   |
+|                         | `MAX_SOURCE_FILE_KB` | `1024`              | Larger source files are skipped (scanning and parsing) |
 |                         | `GIT_CLONE_TIMEOUT_SECONDS` | `120`        | Clone timeout                     |
 | `frontend/.env`         | `VITE_API_URL`  | `http://localhost:8000`  | Backend base URL                  |
 
@@ -141,12 +163,15 @@ Imported code is treated as untrusted input:
   credentials, don't fetch submodules or LFS files, and check out symlinks as plain files.
 - **Project IDs** from URLs are validated before being turned into file paths.
 - The **scanner** never follows symlinks and only reads the first 8 KB of a file to detect binaries.
+- The **parser** re-checks every file before reading it (no symlinks, no paths outside the
+  project, size limit, no binary content) and only builds a syntax tree: Tree-sitter never
+  executes code. Grammars are installed from pinned packages; nothing is downloaded at runtime.
 
 ## Roadmap
 
 1. ✅ Project setup
 2. ✅ Repository ingestion (GitHub clone, ZIP upload, file scanning, language detection)
-3. Tree-sitter integration (Python, Java, JavaScript, TypeScript)
+3. ✅ Tree-sitter integration (Python, Java, JavaScript, TypeScript)
 4. Entity extraction
 5. Relationship extraction
 6. Knowledge graph (Neo4j)

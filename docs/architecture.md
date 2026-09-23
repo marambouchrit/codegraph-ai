@@ -35,12 +35,12 @@ Question → query analysis
 | React frontend     | Import projects, explore code, chat, view the graph | Skeleton |
 | FastAPI backend    | HTTP API, orchestration                             | Project API |
 | Repository manager | Clone / extract / scan repositories                 | ✅ Phase 2 |
-| Code analyzer      | Tree-sitter parsing, entity & relationship extraction | Phases 3–5 |
+| Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (Phase 3); extraction Phases 4–5 |
 | Graph engine       | Neo4j storage and graph queries                     | Phases 6–7 |
 | RAG engine         | Chunking, embeddings, Qdrant, hybrid retrieval      | Phases 8–9 |
 | Chat engine        | Prompting and LLM provider abstraction              | Phase 10 |
 
-## Current backend layout (Phase 2)
+## Current backend layout (Phase 3)
 
 ```
 backend/app/
@@ -57,16 +57,24 @@ backend/app/
 ├── schemas/project.py       # API request/response models
 ├── services/
 │   └── project_service.py   # orchestrates ingestion; the only place combining the pieces below
-└── ingestion/               # small, independent building blocks
-    ├── github.py            # URL validation + safe shallow `git clone`
-    ├── zip_handler.py       # safe ZIP extraction
-    ├── workspace.py         # workspace folders, project IDs, deletion
-    ├── scanner.py           # recursive source-file discovery
-    └── languages.py         # file extension -> Language
+├── ingestion/               # small, independent building blocks
+│   ├── github.py            # URL validation + safe shallow `git clone`
+│   ├── zip_handler.py       # safe ZIP extraction
+│   ├── workspace.py         # workspace folders, project IDs, deletion
+│   ├── scanner.py           # recursive source-file discovery
+│   └── languages.py         # file extension -> Language
+└── parsing/                 # Tree-sitter: source file -> syntax tree (Phase 3)
+    ├── base.py              # LanguageParser base class, ParseResult, syntax-error detection
+    ├── python_parser.py     # one small parser per language: it only picks the grammar
+    ├── java_parser.py
+    ├── javascript_parser.py
+    ├── typescript_parser.py # .ts/.mts/.cts -> TypeScript grammar, .tsx -> TSX grammar
+    └── service.py           # ParserService: safe file reading + parser selection
 ```
 
-Dependencies point one way: `routes → services → ingestion`. The ingestion modules know
-nothing about FastAPI, so they are easy to test and to reuse in later phases.
+Dependencies point one way: `routes → services → ingestion` and `parsing → ingestion`
+(`parsing` reuses `Language` and `ScannedFile`). Neither `ingestion` nor `parsing` knows anything
+about FastAPI, so they are easy to test and to reuse in later phases.
 
 ## Ingestion pipeline (Phase 2)
 
@@ -100,7 +108,56 @@ Project metadata is stored as a JSON file rather than in a database. That is eno
 phase and needs no extra setup. A relational database can replace it later if needs grow
 (for example analysis status and history).
 
-Phase 3 (Tree-sitter) will parse the files listed by `scan_directory()` from `source/`.
+## Parsing layer (Phase 3)
 
-New packages (`analyzers/`, `graph/`, `rag/`, `llm/`) are added only when the phase that needs
-them is reached.
+The parsing layer turns the files found by `scan_directory()` into
+[Tree-sitter](https://tree-sitter.github.io/) syntax trees (ASTs). It only parses: nothing is
+executed, and no entities are extracted yet (Phase 4).
+
+```
+ScannedFile (path, language)                    e.g. from scan_directory(workspace/<id>/source)
+   │
+   ▼  ParserService.parse_file(root, path, language)
+read_source_file()     refuse symlinks, paths outside the project, files > MAX_SOURCE_FILE_KB,
+   │                   binary files (NUL bytes); the raw bytes are never decoded
+   ▼
+get_parser(language)   Language -> PythonParser | JavaParser | JavaScriptParser | TypeScriptParser
+   │                   unknown language -> UnsupportedLanguageError
+   ▼
+LanguageParser.parse() grammar_for(path) -> tree_sitter.Parser(grammar).parse(bytes)
+   │
+   ▼
+ParseResult            path, language, source, tree, root_node, root_info,
+                       has_syntax_errors, syntax_errors (ERROR / MISSING nodes, 1-based lines)
+```
+
+- **Syntax errors never raise.** Tree-sitter always returns a complete tree and marks the parts
+  it could not understand with `ERROR` nodes (unexpected code) or `MISSING` nodes (a token it
+  had to invent, such as a missing `;`). `find_syntax_errors()` lists up to 50 of them, in
+  source order, so later phases can still use the valid parts of a broken file.
+- **One bad file never stops a project.** `ParserService.parse_files()` returns a `ParseReport`:
+  `results` (parsed files, with or without syntax errors) and `failures` (files that could not be
+  read or have no parser, with a reason).
+- **Adding a language** means adding a grammar package, a `Language` value with its extensions,
+  and a `LanguageParser` subclass that returns the grammar.
+
+### Why individual grammar packages
+
+The official per-language packages (`tree-sitter-python`, `tree-sitter-java`,
+`tree-sitter-javascript`, `tree-sitter-typescript`) were chosen over `tree-sitter-language-pack`:
+
+| | Individual packages | `tree-sitter-language-pack` (1.x) |
+| --- | --- | --- |
+| Grammars | Compiled into the wheel at install time | Wheel ships none; native parser libraries are **downloaded at runtime** into a cache |
+| Offline / tests | Work offline | First use of a language needs internet |
+| Security | Only code pinned in `requirements.txt` | Native code fetched while the server runs |
+| Size | ~0.5 MB for our 4 languages | Pack for 300+ languages we do not need |
+| Maintainer | The Tree-sitter organization | Third party |
+
+We need only four languages, so the pack's breadth brings no benefit, while downloading native
+code at runtime conflicts with the project's security and offline-testing rules.
+
+## Future packages
+
+New packages (`graph/`, `rag/`, `llm/`) are added only when the phase that needs them is
+reached. Entity and relationship extraction (Phases 4–5) will build on `parsing/`.

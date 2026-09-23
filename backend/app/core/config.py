@@ -1,6 +1,7 @@
 """Application settings loaded from environment variables and the `.env` file."""
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +16,16 @@ class Settings(BaseSettings):
 
     # Stored as a comma-separated string so it is easy to set in `.env`.
     cors_origins: str = "http://localhost:5173"
+
+    # --- Repository ingestion ---
+    # Imported projects are stored here (relative paths start from where the server is launched).
+    workspace_dir: Path = Path("workspace")
+    max_upload_size_mb: int = 50
+    max_extracted_size_mb: int = 500
+    max_archive_files: int = 20_000
+    max_repository_size_mb: int = 500
+    max_source_file_kb: int = 1024
+    git_clone_timeout_seconds: int = 120
 
     @property
     def cors_origin_list(self) -> list[str]:

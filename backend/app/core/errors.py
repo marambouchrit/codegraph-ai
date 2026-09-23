@@ -41,3 +41,13 @@ class ContentTooLargeError(AppError):
 
 class NoSourceFilesError(AppError):
     status_code = 422
+
+
+class UnsupportedLanguageError(AppError):
+    status_code = 422
+
+
+class SourceFileError(AppError):
+    """A source file cannot be parsed safely (missing, too large, binary, symlink...)."""
+
+    status_code = 422

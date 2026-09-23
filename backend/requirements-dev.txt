@@ -1,0 +1,4 @@
+# Development and test dependencies (includes runtime deps).
+-r requirements.txt
+pytest>=8.3,<9.0
+httpx2>=2.13,<3.0  # used by FastAPI TestClient

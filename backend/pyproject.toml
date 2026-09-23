@@ -1,0 +1,9 @@
+[project]
+name = "codegraph-ai-backend"
+version = "0.1.0"
+description = "Backend API for CodeGraph AI - GraphRAG-powered codebase analysis assistant"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

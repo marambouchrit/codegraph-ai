@@ -7,9 +7,10 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 3 — Tree-sitter integration. Projects can be imported from GitHub or a ZIP file,
-> their source files are scanned, and each file can be parsed into a syntax tree; analysis features
-> are built incrementally (see [Roadmap](#roadmap)).
+> **Status:** Phase 4 — entity extraction. Projects can be imported from GitHub or a ZIP file,
+> their source files are scanned and parsed into syntax trees, and the files, classes,
+> interfaces, functions and methods they define are extracted; analysis features are built
+> incrementally (see [Roadmap](#roadmap)).
 
 ## Tech stack
 
@@ -115,6 +116,20 @@ for failure in report.failures:
     print("skipped", failure.path, failure.reason)
 ```
 
+Extracting entities (classes, interfaces, functions, methods) reuses the same parser:
+
+```python
+from app.extraction.service import EntityExtractionService
+
+extraction = EntityExtractionService(service)
+files = scan_directory(source_dir, 1024 * 1024).files
+report = extraction.extract_project("<project_id>", source_dir, files)
+
+print(report.entity_counts)          # {"class": 12, "file": 30, "function": 41, ...}
+for entity in report.entities:
+    print(entity.type, entity.qualified_name, f"{entity.file_path}:{entity.start_line}")
+```
+
 ### Frontend
 
 ```bash
@@ -166,13 +181,15 @@ Imported code is treated as untrusted input:
 - The **parser** re-checks every file before reading it (no symlinks, no paths outside the
   project, size limit, no binary content) and only builds a syntax tree: Tree-sitter never
   executes code. Grammars are installed from pinned packages; nothing is downloaded at runtime.
+- **Entity extraction** only reads the syntax tree: repository code is never imported,
+  evaluated or run.
 
 ## Roadmap
 
 1. ✅ Project setup
 2. ✅ Repository ingestion (GitHub clone, ZIP upload, file scanning, language detection)
 3. ✅ Tree-sitter integration (Python, Java, JavaScript, TypeScript)
-4. Entity extraction
+4. ✅ Entity extraction (files, classes, interfaces, functions, methods)
 5. Relationship extraction
 6. Knowledge graph (Neo4j)
 7. Graph retrieval

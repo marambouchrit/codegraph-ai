@@ -35,12 +35,12 @@ Question → query analysis
 | React frontend     | Import projects, explore code, chat, view the graph | Skeleton |
 | FastAPI backend    | HTTP API, orchestration                             | Project API |
 | Repository manager | Clone / extract / scan repositories                 | ✅ Phase 2 |
-| Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (Phase 3); extraction Phases 4–5 |
+| Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (3), entities (4); relationships Phase 5 |
 | Graph engine       | Neo4j storage and graph queries                     | Phases 6–7 |
 | RAG engine         | Chunking, embeddings, Qdrant, hybrid retrieval      | Phases 8–9 |
 | Chat engine        | Prompting and LLM provider abstraction              | Phase 10 |
 
-## Current backend layout (Phase 3)
+## Current backend layout (Phase 4)
 
 ```
 backend/app/
@@ -63,17 +63,25 @@ backend/app/
 │   ├── workspace.py         # workspace folders, project IDs, deletion
 │   ├── scanner.py           # recursive source-file discovery
 │   └── languages.py         # file extension -> Language
-└── parsing/                 # Tree-sitter: source file -> syntax tree (Phase 3)
-    ├── base.py              # LanguageParser base class, ParseResult, syntax-error detection
-    ├── python_parser.py     # one small parser per language: it only picks the grammar
-    ├── java_parser.py
-    ├── javascript_parser.py
-    ├── typescript_parser.py # .ts/.mts/.cts -> TypeScript grammar, .tsx -> TSX grammar
-    └── service.py           # ParserService: safe file reading + parser selection
+├── parsing/                 # Tree-sitter: source file -> syntax tree (Phase 3)
+│   ├── base.py              # LanguageParser base class, ParseResult, syntax-error detection
+│   ├── python_parser.py     # one small parser per language: it only picks the grammar
+│   ├── java_parser.py
+│   ├── javascript_parser.py
+│   ├── typescript_parser.py # .ts/.mts/.cts -> TypeScript grammar, .tsx -> TSX grammar
+│   └── service.py           # ParserService: safe file reading + parser selection
+└── extraction/              # syntax tree -> code entities (Phase 4)
+    ├── models.py            # Entity, EntityType, FileEntities, ExtractionReport
+    ├── base.py              # EntityExtractor: shared tree walk, qualified names, IDs
+    ├── python_extractor.py  # one extractor per language: which nodes define entities
+    ├── java_extractor.py
+    ├── javascript_extractor.py
+    ├── typescript_extractor.py  # extends the JavaScript extractor (.ts and .tsx)
+    └── service.py           # EntityExtractionService: extractor selection, whole projects
 ```
 
-Dependencies point one way: `routes → services → ingestion` and `parsing → ingestion`
-(`parsing` reuses `Language` and `ScannedFile`). Neither `ingestion` nor `parsing` knows anything
+Dependencies point one way: `routes → services → ingestion`, `parsing → ingestion` and
+`extraction → parsing → ingestion`. None of `ingestion`, `parsing` or `extraction` knows anything
 about FastAPI, so they are easy to test and to reuse in later phases.
 
 ## Ingestion pipeline (Phase 2)
@@ -112,7 +120,7 @@ phase and needs no extra setup. A relational database can replace it later if ne
 
 The parsing layer turns the files found by `scan_directory()` into
 [Tree-sitter](https://tree-sitter.github.io/) syntax trees (ASTs). It only parses: nothing is
-executed, and no entities are extracted yet (Phase 4).
+executed. Entities are extracted from these trees by the extraction layer (Phase 4).
 
 ```
 ScannedFile (path, language)                    e.g. from scan_directory(workspace/<id>/source)
@@ -157,7 +165,83 @@ The official per-language packages (`tree-sitter-python`, `tree-sitter-java`,
 We need only four languages, so the pack's breadth brings no benefit, while downloading native
 code at runtime conflicts with the project's security and offline-testing rules.
 
+## Entity extraction (Phase 4)
+
+The extraction layer walks each syntax tree and lists the **entities** it defines. Each entity
+is designed to become one node of the Neo4j graph in Phase 6.
+
+```
+ScannedFile ─> ParserService.parse_file() ─> ParseResult ─> EntityExtractionService.extract()
+                     (Phase 3)                                  │  get_extractor(language)
+                                                                ▼
+                                           PythonExtractor | JavaExtractor |
+                                           JavaScriptExtractor | TypeScriptExtractor
+                                                                │  EntityExtractor.extract()
+                                                                ▼
+                                           FileEntities: [File, Class, Method, Function...]
+```
+
+`EntityExtractionService.extract_project()` does this for every file, one at a time, so each
+syntax tree is released as soon as its entities are extracted. Files that cannot be read or have
+no parser are recorded as failures (Phase 3's `ParseFailure`); they never stop the others.
+
+### Entity model
+
+| Field | Example |
+| --- | --- |
+| `id` | `3f2a…c9:src/models/user.py:User.login` |
+| `type` | `file`, `class`, `interface`, `function`, `method` |
+| `name` / `qualified_name` | `login` / `User.login` |
+| `file_path`, `language` | `src/models/user.py`, `python` |
+| `start_line`, `start_column`, `end_line`, `end_column` | 1-based, like `SyntaxErrorInfo` |
+| `parent_id` | ID of the enclosing entity (`None` only for files) |
+
+- **Hierarchy through `parent_id`:** File → Class → Method, File → Function, Class → nested
+  Class, Function → nested Function. Phase 6 turns these links into `CONTAINS` edges.
+- **Method or function?** A function whose nearest enclosing entity is a class or interface is a
+  METHOD; anywhere else (module level, inside another function) it is a FUNCTION.
+- **Language mapping:** Python `class_definition`, `function_definition`; Java classes, enums and
+  records → CLASS, interfaces and annotation types → INTERFACE, methods and constructors →
+  METHOD; JavaScript/TypeScript classes, function declarations, functions/classes assigned to a
+  variable (`const f = () => {}`), class methods and arrow-function fields; TypeScript adds
+  interfaces, abstract classes, interface method signatures and abstract methods. Each extractor
+  module documents its exact node types.
+- **Project** entities are not extracted: the project already exists (`Project` in
+  `project.json`, and its ID prefixes every entity ID). **Module** entities are not extracted
+  either: in Python, JavaScript and TypeScript a module *is* a file, so the FILE entity plays
+  that role. Java packages (and Python packages as folders) can be derived from paths and
+  `package` declarations when Phase 5/6 need them for imports.
+
+### IDs
+
+`<project_id>:<file_path>` for files and `<project_id>:<file_path>:<qualified_name>` for the
+rest. They are deterministic (the same code always gives the same IDs), readable, unique across
+projects, and they do not change when code moves to another line. When one file defines the
+same qualified name more than once (Java overloads, a Python function redefined), the second
+gets `#2`, the third `#3`, in source order.
+
+### Tree walk instead of Tree-sitter queries
+
+Extraction uses a direct traversal with an explicit stack (like `find_syntax_errors`), carrying
+the nearest enclosing entity for every node. That gives the parent of each entity for free,
+which is what decides "method or function" and builds qualified names. Tree-sitter queries
+return flat lists of matches, so the hierarchy would have to be rebuilt afterwards, and they add
+a second pattern language to learn. Queries may be worth it in Phase 5 for call and import
+patterns.
+
+### Broken code
+
+Files with syntax errors are not rejected. Every well-formed definition is extracted, but
+nothing is invented:
+- a definition whose name is missing or broken is skipped **with everything inside it**, so its
+  methods are never attached to the wrong parent;
+- code inside an `ERROR` node is ignored: Tree-sitter could not understand its context (a
+  method there can look like a module-level function).
+
+A broken region can therefore hide a few entities, but no entity is ever reported with the wrong
+type or parent.
+
 ## Future packages
 
 New packages (`graph/`, `rag/`, `llm/`) are added only when the phase that needs them is
-reached. Entity and relationship extraction (Phases 4–5) will build on `parsing/`.
+reached. Relationship extraction (Phase 5) will build on `extraction/`.

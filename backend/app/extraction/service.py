@@ -9,7 +9,7 @@ other layers, it knows nothing about FastAPI.
 """
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from app.core.errors import AppError, UnsupportedLanguageError
@@ -66,18 +66,27 @@ class EntityExtractionService:
         )
 
     def extract_project(
-        self, project_id: str, root: Path, files: Iterable[ScannedFile]
+        self,
+        project_id: str,
+        root: Path,
+        files: Iterable[ScannedFile],
+        on_file: Callable[[ParseResult, FileEntities], None] | None = None,
     ) -> ExtractionReport:
         """Parse and extract every file, one at a time.
 
         Each syntax tree is released as soon as its entities are extracted, so memory
         use does not grow with the number of files (only the small entities are kept).
+        `on_file`, if given, is called for each file while its syntax tree is still
+        available: relationship extraction (Phase 5) uses it to avoid parsing twice.
         """
         report = ExtractionReport(project_id=project_id)
         for file in files:
             try:
                 parse_result = self.parser_service.parse_file(root, file.path, file.language)
-                report.files.append(self.extract(parse_result, project_id))
+                file_entities = self.extract(parse_result, project_id)
+                if on_file is not None:
+                    on_file(parse_result, file_entities)
+                report.files.append(file_entities)
             except AppError as error:
                 report.failures.append(ParseFailure(path=file.path, reason=error.message))
             except Exception:

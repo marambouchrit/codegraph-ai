@@ -9,6 +9,7 @@ file and never runs any code.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from pathlib import PurePosixPath
 
 import tree_sitter
@@ -41,9 +42,26 @@ class EntityExtractor(ABC):
 
     def extract(self, parse_result: ParseResult, project_id: str) -> list[Entity]:
         """Return the FILE entity followed by every entity found in the tree, in source order."""
+        # A new entity is first met at its own definition node, and walk() visits nodes in
+        # source order, so the dict keeps the entities in source order too.
+        entities: dict[str, Entity] = {}
+        for _node, entity in self.walk(parse_result, project_id):
+            entities.setdefault(entity.id, entity)
+        return list(entities.values())
+
+    def walk(
+        self, parse_result: ParseResult, project_id: str
+    ) -> Iterator[tuple[tree_sitter.Node, Entity]]:
+        """Yield every trusted syntax node with the entity it belongs to, in source order.
+
+        The root node comes first, with the FILE entity. A definition node (a class, a
+        function...) belongs to the entity it defines, and so does everything inside it.
+        Relationship extraction (Phase 5) uses this walk, so it attributes every call or
+        import to exactly the entity found here, and skips exactly the same broken code.
+        """
         ids = _IdGenerator(project_id, parse_result.path)
         file_entity = self._file_entity(parse_result, ids.file_id())
-        entities = [file_entity]
+        yield parse_result.root_node, file_entity
 
         # Walk the tree with an explicit stack (no recursion, like find_syntax_errors).
         # Each item is (syntax node, nearest enclosing entity).
@@ -62,10 +80,9 @@ class EntityExtractor(ABC):
                     # A definition whose name is missing or broken (bad syntax): skip it and
                     # everything inside, rather than attach its children to the wrong parent.
                     continue
-                entities.append(entity)
                 parent = entity
+            yield node, parent
             stack.extend((child, parent) for child in reversed(node.children))
-        return entities
 
     def _file_entity(self, parse_result: ParseResult, entity_id: str) -> Entity:
         end = parse_result.root_node.end_point

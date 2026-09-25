@@ -35,12 +35,12 @@ Question → query analysis
 | React frontend     | Import projects, explore code, chat, view the graph | Skeleton |
 | FastAPI backend    | HTTP API, orchestration                             | Project API |
 | Repository manager | Clone / extract / scan repositories                 | ✅ Phase 2 |
-| Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (3), entities (4); relationships Phase 5 |
+| Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (3), entities (4), relationships (5) |
 | Graph engine       | Neo4j storage and graph queries                     | Phases 6–7 |
 | RAG engine         | Chunking, embeddings, Qdrant, hybrid retrieval      | Phases 8–9 |
 | Chat engine        | Prompting and LLM provider abstraction              | Phase 10 |
 
-## Current backend layout (Phase 4)
+## Current backend layout (Phase 5)
 
 ```
 backend/app/
@@ -70,18 +70,29 @@ backend/app/
 │   ├── javascript_parser.py
 │   ├── typescript_parser.py # .ts/.mts/.cts -> TypeScript grammar, .tsx -> TSX grammar
 │   └── service.py           # ParserService: safe file reading + parser selection
-└── extraction/              # syntax tree -> code entities (Phase 4)
-    ├── models.py            # Entity, EntityType, FileEntities, ExtractionReport
-    ├── base.py              # EntityExtractor: shared tree walk, qualified names, IDs
-    ├── python_extractor.py  # one extractor per language: which nodes define entities
-    ├── java_extractor.py
-    ├── javascript_extractor.py
-    ├── typescript_extractor.py  # extends the JavaScript extractor (.ts and .tsx)
-    └── service.py           # EntityExtractionService: extractor selection, whole projects
+├── extraction/              # syntax tree -> code entities (Phase 4)
+│   ├── models.py            # Entity, EntityType, FileEntities, ExtractionReport
+│   ├── base.py              # EntityExtractor: shared tree walk (walk()), qualified names, IDs
+│   ├── python_extractor.py  # one extractor per language: which nodes define entities
+│   ├── java_extractor.py
+│   ├── javascript_extractor.py
+│   ├── typescript_extractor.py  # extends the JavaScript extractor (.ts and .tsx)
+│   └── service.py           # EntityExtractionService: extractor selection, whole projects
+└── relationships/           # entities -> relationships between them (Phase 5)
+    ├── models.py            # Relationship, RelationshipType, UnresolvedReference, RelationshipReport
+    ├── references.py        # raw facts found in one file: Reference, Import, VariableType
+    ├── base.py              # ReferenceCollector: visits EntityExtractor.walk(), shared helpers
+    ├── python_references.py # one collector per language: which nodes are imports, calls...
+    ├── java_references.py
+    ├── javascript_references.py
+    ├── typescript_references.py # extends the JavaScript collector
+    ├── modules.py           # ModuleIndex: import -> project file (Python, JS/TS, Java packages)
+    ├── resolver.py          # ReferenceResolver: name -> entity, shared by all languages
+    └── service.py           # RelationshipExtractionService: collect per file, then resolve
 ```
 
 Dependencies point one way: `routes → services → ingestion`, `parsing → ingestion` and
-`extraction → parsing → ingestion`. None of `ingestion`, `parsing` or `extraction` knows anything
+`relationships → extraction → parsing → ingestion`. None of these layers knows anything
 about FastAPI, so they are easy to test and to reuse in later phases.
 
 ## Ingestion pipeline (Phase 2)
@@ -241,7 +252,73 @@ nothing is invented:
 A broken region can therefore hide a few entities, but no entity is ever reported with the wrong
 type or parent.
 
+## Relationship extraction (Phase 5)
+
+The relationship layer connects the entities of Phase 4. Each relationship is designed to become
+one edge of the Neo4j graph in Phase 6.
+
+| Type | From → to | Found in |
+| --- | --- | --- |
+| `IMPORTS` | file → file | `import` / `from … import` / `require()` / `export … from` / Java `import` |
+| `INHERITS` | class → class, interface → interface | `class A(B)`, `extends` |
+| `IMPLEMENTS` | class → interface | Java / TypeScript `implements` |
+| `CALLS` | function, method or file → function, method or class | `f()`, `obj.m()`, `this.m()`, `super.m()`; `User()` / `new User()` call the class |
+| `USES` | entity → class, interface (or function for JSX) | type annotations, field / parameter / return types, `<Component />` |
+| `DEPENDS_ON` | file → file | derived: code of A calls, uses, extends or implements code of B |
+
+### Two steps, one parse
+
+Resolving `User` needs the entities of the whole project, but syntax trees are released file by
+file. So the work is split:
+
+```
+per file (tree available)                          whole project (trees released)
+─────────────────────────                          ──────────────────────────────
+ParseResult ─> EntityExtractionService.extract()   ReferenceResolver(all FileEntities,
+         │         -> FileEntities                                   all FileReferences)
+         └─> collector.collect(extractor.walk())   stage 1: IMPORTS, INHERITS, IMPLEMENTS
+                   -> FileReferences               stage 2: CALLS, USES (needs parent classes)
+                      (imports, references,        stage 3: DEPENDS_ON from stages 1–2
+                       variable types)                     -> RelationshipReport
+```
+
+`EntityExtractionService.extract_project(..., on_file=...)` calls the collector while each tree
+is alive, so every file is still parsed exactly once. `EntityExtractor.walk()` (the Phase 4 walk,
+now reusable) gives every node with its enclosing entity: a call inside `User.login` has
+`User.login` as its source, and code skipped by Phase 4 (ERROR nodes, broken definitions) is
+skipped here too.
+
+### Resolution rules
+
+A name is looked up the way the language would: enclosing entities (innermost first; in Java
+also the members of the enclosing classes and their parents), then names bound by imports
+(following re-exports such as `__init__.py` or `index.ts` barrels), then Java same-package
+types and wildcard imports. `obj.method()` is resolved through `self`/`this`, `super`, a class or
+module name, or a variable whose type is written in the code (`u = User()`, `User u`,
+`u: User`, `this.repo = new Repo()`). Methods are also searched in parent classes.
+
+Modules: Python relative imports are resolved from the importing file; absolute imports match
+a file whose source root is an ancestor folder of the importer (the project root, `src/`,
+`backend/`…). JavaScript/TypeScript relative specifiers try TypeScript then JavaScript
+extensions and `index.*`; bare specifiers (`react`) are packages. Java uses `package`
+declarations.
+
+### Unresolved references
+
+Only explicit evidence (a definition or an import) produces a relationship; a name is never
+matched against a random entity elsewhere in the project. Anything else becomes an
+`UnresolvedReference` with a reason: `external` (library), `not_found` (built-ins, globals),
+`ambiguous` (several candidates, e.g. Java overloads) or `unknown_receiver` (`x.m()` with an
+unknown `x`). They are kept out of `relationships` so every edge points to a real node, and are
+reported separately, so Phase 6 can ignore them or later model external libraries.
+
+### IDs and duplicates
+
+`<TYPE>:<source_id>-><target_id>`, e.g. `CALLS:p:auth.py:login->p:user.py:User.save`. The same
+(source, type, target) is one relationship whatever the number of occurrences; it keeps the
+position of the first one. Unresolved references are deduplicated the same way.
+
 ## Future packages
 
 New packages (`graph/`, `rag/`, `llm/`) are added only when the phase that needs them is
-reached. Relationship extraction (Phase 5) will build on `extraction/`.
+reached. The Neo4j graph (Phase 6) will build on `relationships/`.

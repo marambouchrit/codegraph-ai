@@ -7,10 +7,11 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 4 — entity extraction. Projects can be imported from GitHub or a ZIP file,
-> their source files are scanned and parsed into syntax trees, and the files, classes,
-> interfaces, functions and methods they define are extracted; analysis features are built
-> incrementally (see [Roadmap](#roadmap)).
+> **Status:** Phase 5 — relationship extraction. Projects can be imported from GitHub or a ZIP
+> file, their source files are scanned and parsed into syntax trees, the files, classes,
+> interfaces, functions and methods they define are extracted, and the relationships between
+> them (imports, inheritance, calls, type uses, file dependencies) are resolved; analysis
+> features are built incrementally (see [Roadmap](#roadmap)).
 
 ## Tech stack
 
@@ -130,6 +131,21 @@ for entity in report.entities:
     print(entity.type, entity.qualified_name, f"{entity.file_path}:{entity.start_line}")
 ```
 
+Extracting relationships parses each file once and returns the entities too:
+
+```python
+from app.relationships.service import RelationshipExtractionService
+
+relationships = RelationshipExtractionService(extraction)
+report = relationships.extract_project("<project_id>", source_dir, files)
+
+print(report.relationship_counts)    # {"CALLS": 700, "IMPORTS": 200, "INHERITS": 21, ...}
+for relationship in report.relationships:
+    print(relationship.source_id, relationship.type, relationship.target_id)
+for reference in report.unresolved:  # library calls, built-ins, ambiguous names...
+    print(reference.source_id, reference.type, reference.target_name, reference.reason)
+```
+
 ### Frontend
 
 ```bash
@@ -181,8 +197,10 @@ Imported code is treated as untrusted input:
 - The **parser** re-checks every file before reading it (no symlinks, no paths outside the
   project, size limit, no binary content) and only builds a syntax tree: Tree-sitter never
   executes code. Grammars are installed from pinned packages; nothing is downloaded at runtime.
-- **Entity extraction** only reads the syntax tree: repository code is never imported,
-  evaluated or run.
+- **Entity and relationship extraction** only read the syntax tree: repository code is never
+  imported, evaluated or run. Imports are resolved against the list of scanned files only, so an
+  import path such as `../../../etc/passwd` can never make the analyzer open a file, and a
+  relative import that leaves the project is simply left unresolved.
 
 ## Roadmap
 
@@ -190,7 +208,7 @@ Imported code is treated as untrusted input:
 2. ✅ Repository ingestion (GitHub clone, ZIP upload, file scanning, language detection)
 3. ✅ Tree-sitter integration (Python, Java, JavaScript, TypeScript)
 4. ✅ Entity extraction (files, classes, interfaces, functions, methods)
-5. Relationship extraction
+5. ✅ Relationship extraction (imports, inheritance, calls, uses, dependencies)
 6. Knowledge graph (Neo4j)
 7. Graph retrieval
 8. Vector RAG (chunking, embeddings, Qdrant)

@@ -51,3 +51,21 @@ class SourceFileError(AppError):
     """A source file cannot be parsed safely (missing, too large, binary, symlink...)."""
 
     status_code = 422
+
+
+class GraphDatabaseError(AppError):
+    """A Neo4j operation failed (a transaction, a query, a constraint...)."""
+
+    status_code = 500
+
+
+class GraphDatabaseUnavailableError(GraphDatabaseError):
+    """Neo4j cannot be reached (not started, wrong host, network problem)."""
+
+    status_code = 503
+
+
+class GraphDatabaseConfigError(GraphDatabaseError):
+    """Neo4j is reachable but the configuration is wrong (credentials, URI, database name)."""
+
+    status_code = 503

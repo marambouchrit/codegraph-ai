@@ -7,6 +7,10 @@ requires-python = ">=3.11"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-# Tests that need internet access are skipped by default. Run them with: pytest -m network
-addopts = "-m 'not network'"
-markers = ["network: tests that need internet access"]
+# Tests that need internet access or a running Neo4j server are skipped by default.
+# Run them with: pytest -m network / pytest -m neo4j
+addopts = "-m 'not network and not neo4j'"
+markers = [
+    "network: tests that need internet access",
+    "neo4j: tests that need a running Neo4j server (docker compose up -d neo4j)",
+]

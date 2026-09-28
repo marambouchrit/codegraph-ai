@@ -19,15 +19,15 @@ relationship_service = RelationshipExtractionService(extraction_service)
 Edge = tuple[str, str, str]
 
 
-def analyze(files: dict[str, str]) -> RelationshipReport:
+def analyze(files: dict[str, str], project_id: str = PROJECT_ID) -> RelationshipReport:
     """Parse, extract and resolve a project given as {path: source}, without any disk access."""
-    extraction = ExtractionReport(project_id=PROJECT_ID)
+    extraction = ExtractionReport(project_id=project_id)
     references = []
     for path, source in files.items():
         parse_result = parser_service.parse_source(source.encode(), path)
-        file_entities = extraction_service.extract(parse_result, PROJECT_ID)
+        file_entities = extraction_service.extract(parse_result, project_id)
         extraction.files.append(file_entities)
-        references.append(relationship_service.collect(parse_result, file_entities, PROJECT_ID))
+        references.append(relationship_service.collect(parse_result, file_entities, project_id))
     return relationship_service.resolve(extraction, references)
 
 

@@ -3,6 +3,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +27,15 @@ class Settings(BaseSettings):
     max_repository_size_mb: int = 500
     max_source_file_kb: int = 1024
     git_clone_timeout_seconds: int = 120
+
+    # --- Knowledge graph (Neo4j) ---
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_username: str = "neo4j"
+    # SecretStr hides the value in logs and error messages (it prints as '**********').
+    neo4j_password: SecretStr = SecretStr("")
+    neo4j_database: str = "neo4j"
+    # Number of nodes or relationships sent to Neo4j in one query (see app/graph/repository.py).
+    graph_batch_size: int = 1000
 
     @property
     def cors_origin_list(self) -> list[str]:

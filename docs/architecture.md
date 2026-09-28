@@ -36,11 +36,11 @@ Question → query analysis
 | FastAPI backend    | HTTP API, orchestration                             | Project API |
 | Repository manager | Clone / extract / scan repositories                 | ✅ Phase 2 |
 | Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (3), entities (4), relationships (5) |
-| Graph engine       | Neo4j storage and graph queries                     | Phases 6–7 |
+| Graph engine       | Neo4j storage and graph queries                     | ✅ Storage (6); queries Phase 7 |
 | RAG engine         | Chunking, embeddings, Qdrant, hybrid retrieval      | Phases 8–9 |
 | Chat engine        | Prompting and LLM provider abstraction              | Phase 10 |
 
-## Current backend layout (Phase 5)
+## Current backend layout (Phase 6)
 
 ```
 backend/app/
@@ -55,8 +55,9 @@ backend/app/
 │       ├── health.py        # GET /health
 │       └── projects.py      # /projects endpoints (thin: call the service, return schemas)
 ├── schemas/project.py       # API request/response models
-├── services/
-│   └── project_service.py   # orchestrates ingestion; the only place combining the pieces below
+├── services/                # orchestration: the only places combining the packages below
+│   ├── project_service.py   # ingestion: workspace, clone/ZIP, scan, project.json
+│   └── graph_service.py     # knowledge graph: analysis (Phases 3-5) -> Neo4j
 ├── ingestion/               # small, independent building blocks
 │   ├── github.py            # URL validation + safe shallow `git clone`
 │   ├── zip_handler.py       # safe ZIP extraction
@@ -78,21 +79,28 @@ backend/app/
 │   ├── javascript_extractor.py
 │   ├── typescript_extractor.py  # extends the JavaScript extractor (.ts and .tsx)
 │   └── service.py           # EntityExtractionService: extractor selection, whole projects
-└── relationships/           # entities -> relationships between them (Phase 5)
-    ├── models.py            # Relationship, RelationshipType, UnresolvedReference, RelationshipReport
-    ├── references.py        # raw facts found in one file: Reference, Import, VariableType
-    ├── base.py              # ReferenceCollector: visits EntityExtractor.walk(), shared helpers
-    ├── python_references.py # one collector per language: which nodes are imports, calls...
-    ├── java_references.py
-    ├── javascript_references.py
-    ├── typescript_references.py # extends the JavaScript collector
-    ├── modules.py           # ModuleIndex: import -> project file (Python, JS/TS, Java packages)
-    ├── resolver.py          # ReferenceResolver: name -> entity, shared by all languages
-    └── service.py           # RelationshipExtractionService: collect per file, then resolve
+├── relationships/           # entities -> relationships between them (Phase 5)
+│   ├── models.py            # Relationship, RelationshipType, UnresolvedReference, RelationshipReport
+│   ├── references.py        # raw facts found in one file: Reference, Import, VariableType
+│   ├── base.py              # ReferenceCollector: visits EntityExtractor.walk(), shared helpers
+│   ├── python_references.py # one collector per language: which nodes are imports, calls...
+│   ├── java_references.py
+│   ├── javascript_references.py
+│   ├── typescript_references.py # extends the JavaScript collector
+│   ├── modules.py           # ModuleIndex: import -> project file (Python, JS/TS, Java packages)
+│   ├── resolver.py          # ReferenceResolver: name -> entity, shared by all languages
+│   └── service.py           # RelationshipExtractionService: collect per file, then resolve
+└── graph/                   # Neo4j knowledge graph (Phase 6); no Tree-sitter, no FastAPI
+    ├── client.py            # Neo4jClient: driver, sessions, transactions, error translation
+    ├── schema.py            # labels, relationship types, constraint/index (whitelists)
+    ├── models.py            # GraphNode, GraphEdge, GraphBuildReport, GraphStatistics
+    ├── repository.py        # GraphRepository: all the Cypher (UNWIND + MERGE, deletes, stats)
+    └── builder.py           # GraphBuilder: RelationshipReport -> nodes and edges
 ```
 
-Dependencies point one way: `routes → services → ingestion`, `parsing → ingestion` and
-`relationships → extraction → parsing → ingestion`. None of these layers knows anything
+Dependencies point one way: `routes → services → ingestion`, `parsing → ingestion`,
+`relationships → extraction → parsing → ingestion` and `services → graph → relationships`
+(`graph/` only consumes Phase 4–5 data: it never parses code). None of these layers knows anything
 about FastAPI, so they are easy to test and to reuse in later phases.
 
 ## Ingestion pipeline (Phase 2)
@@ -318,7 +326,117 @@ reported separately, so Phase 6 can ignore them or later model external librarie
 (source, type, target) is one relationship whatever the number of occurrences; it keeps the
 position of the first one. Unresolved references are deduplicated the same way.
 
+## Knowledge graph (Phase 6)
+
+**Why Neo4j:** code is naturally a graph, and the questions later phases must answer are graph
+questions ("who calls `User.save`?", "what depends on `auth.py`?"). A graph database stores the
+connections themselves, so following them is cheap, and Cypher queries read like the question:
+`MATCH (f)-[:CALLS]->(m:Method {name: "save"}) RETURN f`.
+
+```
+GraphService.build_project_graph(project_id)
+   1. ProjectService.get_project()            unknown project -> ProjectNotFoundError
+   2. Neo4jClient.verify_connectivity()       fail fast, before the analysis
+   3. RelationshipExtractionService           Phases 3-5: entities + relationships (one parse)
+   4. GraphBuilder.build(RelationshipReport)
+        graph_nodes(): Entity       -> GraphNode  (label = entity type)
+        graph_edges(): parent_id    -> CONTAINS edge
+                       Relationship -> GraphEdge  (same ID and type as Phase 5)
+        GraphRepository:
+          ensure_schema()            constraint + index (IF NOT EXISTS)
+          upsert_nodes()             UNWIND $rows + MERGE, one batch per transaction
+          upsert_relationships()
+          delete_stale()             what an older build of this project left
+   -> GraphBuildReport: files, nodes/relationships written (by label/type), stale deleted,
+                        unresolved references, failed files, duration, summary
+```
+
+### Node model
+
+Every node has two labels, `:Entity` and its type (`:File`, `:Class`, `:Interface`, `:Function`,
+`:Method`), and the properties `id` (the Phase 4 entity ID, the node identity; no other ID is
+generated), `project_id`, `entity_type`, `name`, `qualified_name`, `file_path`, `language`,
+`start_line`, `start_column`, `end_line`, `end_column`, `parent_id` (absent on files) and
+`build_id`. For a File, `name` is the file name and `qualified_name` its path. There is no
+Project node: the project lives in `project.json`, and `project_id` on every node scopes it.
+
+### Relationship model
+
+The six Phase 5 types (`IMPORTS`, `INHERITS`, `IMPLEMENTS`, `CALLS`, `USES`, `DEPENDS_ON`) with
+properties `id` (the Phase 5 ID `<TYPE>:<source_id>-><target_id>`), `file_path`, `line`,
+`column` (first occurrence) and `build_id`, plus `CONTAINS` (File → Class/Function, Class →
+Method…), derived from `parent_id`, with an ID in the same format. Unresolved references are
+only counted in the report: they never become nodes or edges.
+
+### Idempotency and stale data
+
+- **Nodes:** `MERGE (n:Entity {id: row.id})` finds the node or creates it, then
+  `SET n += row.properties` updates it. The type label is removed and set again, so an entity
+  that changed type (a function turned into a class) never keeps two labels.
+- **Relationships:** both ends are `MATCH`ed by `id` *and* `project_id`, then
+  `MERGE (source)-[r:CALLS {id: row.id}]->(target)`.
+- **Stale data:** each build stamps a new `build_id` on everything it writes. Once all batches
+  have succeeded, the project's nodes and relationships with another `build_id` (code deleted
+  since the previous build) are deleted. Building twice gives the same graph, and the graph is
+  never emptied before a rebuild. If a batch fails, the error is raised and nothing is deleted:
+  the graph holds old and new data until the next successful build.
+
+### Constraint and index
+
+| Schema | Why |
+| --- | --- |
+| `CONSTRAINT entity_id FOR (n:Entity) REQUIRE n.id IS UNIQUE` | at most one node per entity ID; it also creates the index every `MERGE`/`MATCH` on `id` uses |
+| `INDEX entity_project_id FOR (n:Entity) ON (n.project_id)` | every project operation (delete, stale cleanup, statistics) starts from `project_id` |
+
+No `(project_id, id)` constraint: entity IDs already start with the project ID. The shared
+`:Entity` label exists because a constraint applies to a single label. Both statements use
+`IF NOT EXISTS`, so they run at every build without effect after the first.
+
+### Project isolation
+
+Nodes carry `project_id`; every project-level query filters on it (`delete_project`,
+`delete_stale`, `statistics`, `project_exists`), and relationships are only created between two
+nodes of the same project. The builder refuses an entity whose ID does not start with the
+project ID. Deleting one project's graph never touches the others, and nothing ever deletes the
+whole database.
+
+### Batching
+
+Rows are grouped by label (nodes) or type (relationships), because labels and types are part of
+the query text, and sent `GRAPH_BATCH_SIZE` (1000) at a time as one `$rows` list parameter
+expanded by `UNWIND`: a few queries per thousand entities instead of one per node. Each batch is
+one managed transaction, which the driver retries on temporary errors (safe, because MERGE can be
+repeated). Deletions also run in batches (`WITH n LIMIT $limit DETACH DELETE n`) until nothing is
+left, so a large project never needs one huge transaction.
+
+### Errors
+
+`Neo4jClient.neo4j_errors()` is the only place that sees driver exceptions. It turns them into
+`AppError`s: `GraphDatabaseUnavailableError` (503: server down, session expired, transient error
+still failing after retries), `GraphDatabaseConfigError` (503: wrong credentials, invalid URI,
+unknown database) and `GraphDatabaseError` (500: constraint violation, failed transaction).
+Messages never contain the password, and URIs are shown without any `user:password@` part.
+
+### Security
+
+Values always travel as Cypher parameters (`$rows`, `$project_id`…). Labels and relationship
+types, which Cypher cannot parametrize, come only from the `schema.py` whitelists
+(`node_label()` and `relationship_type()` reject anything else). Credentials come from the
+environment and the password is a `SecretStr`. Docker Compose binds Neo4j to `127.0.0.1`.
+
+### Testing
+
+`pytest` needs no Neo4j: `tests/graph_fakes.py` replaces the **driver** with an in-memory store
+that executes the repository's few queries, so the real client, repository (batches,
+parameters, MERGE keys, project filters) and builder run unchanged. The optional
+`pytest -m neo4j` tests run builds against a real server (random project IDs, cleaned up
+afterwards) and check idempotency, isolation and a `(:Function)-[:CALLS]->()` traversal.
+
+Not in Phase 6, on purpose: graph API endpoints, retrieval queries, and deleting the graph when
+a project is deleted through the API (that would make project deletion depend on Neo4j being up;
+it will be wired together with the graph endpoints).
+
 ## Future packages
 
-New packages (`graph/`, `rag/`, `llm/`) are added only when the phase that needs them is
-reached. The Neo4j graph (Phase 6) will build on `relationships/`.
+New packages (`rag/`, `llm/`) are added only when the phase that needs them is reached. Graph
+retrieval (Phase 7) will build on `graph/`.

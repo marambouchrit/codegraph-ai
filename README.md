@@ -7,11 +7,11 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 5 — relationship extraction. Projects can be imported from GitHub or a ZIP
-> file, their source files are scanned and parsed into syntax trees, the files, classes,
-> interfaces, functions and methods they define are extracted, and the relationships between
-> them (imports, inheritance, calls, type uses, file dependencies) are resolved; analysis
-> features are built incrementally (see [Roadmap](#roadmap)).
+> **Status:** Phase 6 — Neo4j knowledge graph. Projects can be imported from GitHub or a ZIP
+> file, their source files are parsed, the files, classes, interfaces, functions and methods they
+> define are extracted, the relationships between them (imports, inheritance, calls, type uses,
+> file dependencies) are resolved, and the result is stored as a knowledge graph in Neo4j;
+> analysis features are built incrementally (see [Roadmap](#roadmap)).
 
 ## Tech stack
 
@@ -19,7 +19,7 @@ project — with answers grounded in the code and linked to source locations.
 | -------------- | -------------------------------------------- |
 | Backend        | Python 3.11+, FastAPI, Pydantic              |
 | Code analysis  | Tree-sitter (official grammar packages)      |
-| Knowledge graph| Neo4j *(Phase 6)*                            |
+| Knowledge graph| Neo4j 5 (official Python driver)             |
 | Vector search  | Qdrant + open-source embeddings *(Phase 8)*  |
 | LLM            | Provider-agnostic `LLMProvider` *(Phase 10)* |
 | Frontend       | React, TypeScript, Vite                      |
@@ -34,7 +34,8 @@ codegraph-ai/
 │   ├── app/          # application code
 │   └── tests/        # pytest tests
 ├── frontend/         # React + TypeScript + Vite application
-└── docs/             # documentation
+├── docs/             # documentation
+└── docker-compose.yml  # local Neo4j
 ```
 
 ## Getting started
@@ -44,6 +45,7 @@ codegraph-ai/
 - Python 3.11 or newer
 - Git (used to clone GitHub repositories)
 - Node.js 20.19+ (or 22.12+) and npm
+- Docker (only to run Neo4j for the knowledge graph)
 
 ### Backend
 
@@ -70,8 +72,9 @@ Run the tests:
 
 ```bash
 cd backend
-pytest               # fast tests, no internet needed
+pytest               # fast tests: no internet, no Neo4j needed
 pytest -m network    # clones a real repository from GitHub
+pytest -m neo4j      # needs a running Neo4j (see "Knowledge graph" below)
 ```
 
 ### Importing a project (API)
@@ -146,6 +149,67 @@ for reference in report.unresolved:  # library calls, built-ins, ambiguous names
     print(reference.source_id, reference.type, reference.target_name, reference.reason)
 ```
 
+### Knowledge graph (Neo4j)
+
+The analysis is stored in [Neo4j](https://neo4j.com/), a graph database: code *is* a graph
+(files contain classes, functions call methods, classes extend classes), and Neo4j stores and
+queries those connections directly, which later phases need for graph retrieval.
+
+**1. Start Neo4j** (from the repository root; Neo4j 5.26 LTS, Community edition):
+
+```bash
+docker compose up -d neo4j
+docker compose ps               # wait until the status says "healthy" (about 20 s)
+```
+
+The password comes from `NEO4J_PASSWORD` (default `change-me-please`). To choose another one,
+set it in a `.env` file at the repository root (read by Docker Compose) **before the first
+start**, and use the same value in `backend/.env`.
+
+**2. Configure the backend** in `backend/.env` (already in `.env.example`):
+
+```
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=change-me-please
+NEO4J_DATABASE=neo4j
+```
+
+**3. Check that it works:** open the Neo4j Browser at <http://localhost:7474> (user `neo4j`),
+or run `pytest -m neo4j` from `backend/`.
+
+**4. Build a project's graph** (no API endpoint yet; from `backend/`, with the virtual
+environment active):
+
+```python
+from app.core.config import get_settings
+from app.graph.client import Neo4jClient
+from app.graph.repository import GraphRepository
+from app.services.graph_service import GraphService
+
+settings = get_settings()
+with Neo4jClient.from_settings(settings) as client:
+    service = GraphService(settings, GraphRepository(client, settings.graph_batch_size))
+    report = service.build_project_graph("<project_id>")   # an imported project
+    print(report.summary)  # Graph built successfully: 73 files, 412 entities, 1,204 relationships
+```
+
+Building again is safe: it updates the same nodes and relationships (no duplicates) and removes
+what disappeared from the code. `service.delete_project_graph("<project_id>")` removes one
+project's graph only.
+
+**5. Explore it** in the Neo4j Browser:
+
+```cypher
+MATCH (n:Entity {project_id: "<project_id>"}) RETURN n.entity_type, count(*);
+MATCH (:Entity {project_id: "<project_id>"})-[r]->() RETURN type(r), count(*);
+MATCH (f:Function {project_id: "<project_id>"})-[:CALLS]->(m) RETURN f, m LIMIT 50;
+MATCH (c:Class {project_id: "<project_id>", name: "User"})-[:CONTAINS]->(m:Method) RETURN c, m;
+```
+
+**6. Stop it:** `docker compose stop neo4j` (data is kept in a Docker volume);
+`docker compose down -v` removes the container **and** the data.
+
 ### Frontend
 
 ```bash
@@ -177,6 +241,12 @@ Git; each app has a committed `.env.example` template.
 |                         | `MAX_REPOSITORY_SIZE_MB` | `500`           | Maximum size of a cloned repository |
 |                         | `MAX_SOURCE_FILE_KB` | `1024`              | Larger source files are skipped (scanning and parsing) |
 |                         | `GIT_CLONE_TIMEOUT_SECONDS` | `120`        | Clone timeout                     |
+|                         | `NEO4J_URI`     | `bolt://localhost:7687`  | Neo4j server (Bolt protocol)      |
+|                         | `NEO4J_USERNAME` | `neo4j`                 | Neo4j user                        |
+|                         | `NEO4J_PASSWORD` | *(empty)*               | Neo4j password (never logged)     |
+|                         | `NEO4J_DATABASE` | `neo4j`                 | Neo4j database name               |
+|                         | `GRAPH_BATCH_SIZE` | `1000`                | Nodes / relationships per write query |
+| `.env` (root, optional) | `NEO4J_PASSWORD` | `change-me-please`      | Password of the Docker Compose Neo4j |
 | `frontend/.env`         | `VITE_API_URL`  | `http://localhost:8000`  | Backend base URL                  |
 
 ## Security
@@ -201,6 +271,11 @@ Imported code is treated as untrusted input:
   imported, evaluated or run. Imports are resolved against the list of scanned files only, so an
   import path such as `../../../etc/passwd` can never make the analyzer open a file, and a
   relative import that leaves the project is simply left unresolved.
+- **Neo4j**: every value (names, paths, IDs) is sent as a Cypher **parameter**, never pasted into
+  a query; labels and relationship types come from fixed lists in the code. Credentials come
+  from environment variables, the password is a `SecretStr` and never appears in logs or error
+  messages, and Docker Compose exposes Neo4j on `127.0.0.1` only. Every project operation is
+  scoped by `project_id`, so deleting one project's graph never touches another's.
 
 ## Roadmap
 
@@ -209,7 +284,7 @@ Imported code is treated as untrusted input:
 3. ✅ Tree-sitter integration (Python, Java, JavaScript, TypeScript)
 4. ✅ Entity extraction (files, classes, interfaces, functions, methods)
 5. ✅ Relationship extraction (imports, inheritance, calls, uses, dependencies)
-6. Knowledge graph (Neo4j)
+6. ✅ Knowledge graph (Neo4j)
 7. Graph retrieval
 8. Vector RAG (chunking, embeddings, Qdrant)
 9. GraphRAG (hybrid retrieval + context fusion)

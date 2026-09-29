@@ -7,11 +7,12 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 6 — Neo4j knowledge graph. Projects can be imported from GitHub or a ZIP
-> file, their source files are parsed, the files, classes, interfaces, functions and methods they
+> **Status:** Phase 7 — graph retrieval. Projects can be imported from GitHub or a ZIP file,
+> their source files are parsed, the files, classes, interfaces, functions and methods they
 > define are extracted, the relationships between them (imports, inheritance, calls, type uses,
-> file dependencies) are resolved, and the result is stored as a knowledge graph in Neo4j;
-> analysis features are built incrementally (see [Roadmap](#roadmap)).
+> file dependencies) are resolved, the result is stored as a knowledge graph in Neo4j, and that
+> graph can be queried (callers, dependencies, inheritance, paths...); analysis features are
+> built incrementally (see [Roadmap](#roadmap)).
 
 ## Tech stack
 
@@ -210,6 +211,58 @@ MATCH (c:Class {project_id: "<project_id>", name: "User"})-[:CONTAINS]->(m:Metho
 **6. Stop it:** `docker compose stop neo4j` (data is kept in a Docker volume);
 `docker compose down -v` removes the container **and** the data.
 
+### Graph retrieval
+
+Graph retrieval reads the knowledge graph back to answer **structural** questions about the
+code: who calls a method, what a file depends on, which classes implement an interface, how two
+functions are connected. Later phases will use these exact, located answers as the context of
+natural-language answers (GraphRAG). There is no API endpoint yet; from `backend/`:
+
+```python
+from app.core.config import get_settings
+from app.graph.client import Neo4jClient
+from app.graph.repository import GraphRepository
+from app.services.graph_retrieval_service import GraphRetrievalService
+
+settings = get_settings()
+project_id = "<project_id>"  # a project whose graph was built (see above)
+with Neo4jClient.from_settings(settings) as client:
+    retrieval = GraphRetrievalService(GraphRepository(client))
+
+    [user] = retrieval.find_entities(project_id, "User", entity_types=["class"])
+    methods = retrieval.get_contained_entities(project_id, user.id)        # User's methods
+    [save] = retrieval.find_entities(project_id, "User.save")
+    for caller in retrieval.get_callers(project_id, save.id):              # who calls User.save?
+        call = caller.relationship
+        print(caller.entity.qualified_name, f"{call.file_path}:{call.line}")
+    [auth] = retrieval.find_entities(project_id, "auth.py")
+    retrieval.get_transitive_dependencies(project_id, auth.id, max_depth=3)
+    retrieval.find_paths(project_id, auth.id, save.id)                     # how are they connected?
+```
+
+| Question | Method |
+| --- | --- |
+| Find an entity by ID, qualified name or name (`partial=True`: contains) | `find_entities` |
+| An entity with its metadata / with its parent and neighbors | `get_entity` / `get_entity_context` |
+| What is connected to it? | `get_neighbors` |
+| What does a class or file define? | `get_contained_entities` |
+| Who calls it? What does it call? | `get_callers` / `get_callees` |
+| What does a file import? Who imports it? | `get_imports` / `get_importers` |
+| What does a file depend on (directly, transitively)? What depends on it? | `get_dependencies` / `get_transitive_dependencies` / `get_dependents` |
+| Base classes / subclasses | `get_parents` / `get_subclasses` |
+| Interfaces of a class / classes implementing an interface | `get_implemented_interfaces` / `get_implementations` |
+| How are two entities connected? | `find_paths` |
+
+Every operation is scoped to one project, results are limited (`limit`, default 50, at most 200)
+and traversals are bounded (`max_depth`, at most 5). Names shared by several entities return all
+of them. An unknown entity ID raises `EntityNotFoundError`; a question with no answer returns an
+empty list. See [docs/architecture.md](docs/architecture.md#graph-retrieval-phase-7).
+
+**Tests:** `pytest` checks every retrieval operation against an in-memory fake (no server
+needed). `pytest -m neo4j` (Neo4j started, `NEO4J_PASSWORD` in `backend/.env` matching the
+Docker Compose password) also asks every retrieval question to the real server and to the fake,
+and requires identical answers.
+
 ### Frontend
 
 ```bash
@@ -276,6 +329,10 @@ Imported code is treated as untrusted input:
   from environment variables, the password is a `SecretStr` and never appears in logs or error
   messages, and Docker Compose exposes Neo4j on `127.0.0.1` only. Every project operation is
   scoped by `project_id`, so deleting one project's graph never touches another's.
+- **Graph retrieval** offers fixed, typed questions only (no "run this Cypher"). Every query is
+  scoped by `project_id` (an entity ID of another project is rejected before reaching Neo4j),
+  traversal depths are checked integers from 1 to 5 (never an unbounded `*`), and every result
+  list has a limit.
 
 ## Roadmap
 
@@ -285,7 +342,7 @@ Imported code is treated as untrusted input:
 4. ✅ Entity extraction (files, classes, interfaces, functions, methods)
 5. ✅ Relationship extraction (imports, inheritance, calls, uses, dependencies)
 6. ✅ Knowledge graph (Neo4j)
-7. Graph retrieval
+7. ✅ Graph retrieval
 8. Vector RAG (chunking, embeddings, Qdrant)
 9. GraphRAG (hybrid retrieval + context fusion)
 10. LLM assistant (`POST /projects/{id}/chat`)

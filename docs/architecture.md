@@ -36,11 +36,11 @@ Question → query analysis
 | FastAPI backend    | HTTP API, orchestration                             | Project API |
 | Repository manager | Clone / extract / scan repositories                 | ✅ Phase 2 |
 | Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (3), entities (4), relationships (5) |
-| Graph engine       | Neo4j storage and graph queries                     | ✅ Storage (6); queries Phase 7 |
+| Graph engine       | Neo4j storage and graph queries                     | ✅ Storage (6), retrieval (7) |
 | RAG engine         | Chunking, embeddings, Qdrant, hybrid retrieval      | Phases 8–9 |
 | Chat engine        | Prompting and LLM provider abstraction              | Phase 10 |
 
-## Current backend layout (Phase 6)
+## Current backend layout (Phase 7)
 
 ```
 backend/app/
@@ -57,7 +57,8 @@ backend/app/
 ├── schemas/project.py       # API request/response models
 ├── services/                # orchestration: the only places combining the packages below
 │   ├── project_service.py   # ingestion: workspace, clone/ZIP, scan, project.json
-│   └── graph_service.py     # knowledge graph: analysis (Phases 3-5) -> Neo4j
+│   ├── graph_service.py     # knowledge graph: analysis (Phases 3-5) -> Neo4j
+│   └── graph_retrieval_service.py  # graph retrieval: validation, defaults, "not found"
 ├── ingestion/               # small, independent building blocks
 │   ├── github.py            # URL validation + safe shallow `git clone`
 │   ├── zip_handler.py       # safe ZIP extraction
@@ -93,8 +94,9 @@ backend/app/
 └── graph/                   # Neo4j knowledge graph (Phase 6); no Tree-sitter, no FastAPI
     ├── client.py            # Neo4jClient: driver, sessions, transactions, error translation
     ├── schema.py            # labels, relationship types, constraint/index (whitelists)
-    ├── models.py            # GraphNode, GraphEdge, GraphBuildReport, GraphStatistics
-    ├── repository.py        # GraphRepository: all the Cypher (UNWIND + MERGE, deletes, stats)
+    ├── models.py            # GraphNode, GraphEdge, GraphBuildReport, GraphStatistics,
+    │                        # retrieval results: EntityResult, RelatedEntity, GraphPath...
+    ├── repository.py        # GraphRepository: all the Cypher (writes, stats, retrieval reads)
     └── builder.py           # GraphBuilder: RelationshipReport -> nodes and edges
 ```
 
@@ -432,11 +434,121 @@ parameters, MERGE keys, project filters) and builder run unchanged. The optional
 `pytest -m neo4j` tests run builds against a real server (random project IDs, cleaned up
 afterwards) and check idempotency, isolation and a `(:Function)-[:CALLS]->()` traversal.
 
-Not in Phase 6, on purpose: graph API endpoints, retrieval queries, and deleting the graph when
-a project is deleted through the API (that would make project deletion depend on Neo4j being up;
-it will be wired together with the graph endpoints).
+Not in Phase 6, on purpose: graph API endpoints and deleting the graph when a project is deleted
+through the API (that would make project deletion depend on Neo4j being up; it will be wired
+together with the graph endpoints).
+
+## Graph retrieval (Phase 7)
+
+**What it is:** reading the knowledge graph back to answer *structural* questions about the
+code: who calls this method, what does this file depend on, how are these two functions
+connected. Text search or embeddings (Phase 8) find code that *looks* relevant; only the graph
+knows how pieces are *connected*, and its answers are exact and come with source locations.
+Phase 9 (GraphRAG) will combine both to build the context of an LLM answer.
+
+```
+GraphRetrievalService          app/services/graph_retrieval_service.py
+   validates: project ID format, entity ID of this project, depth, limit, search text, types
+   defaults:  limit 50 (max 200), transitive depth 3, path depth 4, 5 paths (max 20)
+   errors:    unknown entity -> EntityNotFoundError (404), bad argument -> InvalidGraphQueryError (400)
+        ↓
+GraphRepository                app/graph/repository.py: one fixed query shape per operation
+        ↓
+Neo4jClient.read()             read transaction; driver errors -> GraphDatabase*Error
+        ↓
+Neo4j
+```
+
+The service has no Cypher; the repository validates only what could change the query text.
+Results are typed models (`app/graph/models.py`), never raw Neo4j records: `EntityResult` (ID,
+type, name, qualified name, project, file, language, start/end line and column, parent ID),
+`RelationshipResult` (ID, type, source, target, and the file, line and column where the call or
+import is), `RelatedEntity` (an entity, the direction, and the relationship followed or the depth
+reached), `GraphPath` (nodes and the relationships between them) and `GraphContext` (an entity,
+its parent and its neighbors).
+
+### Operations
+
+| Question | Service method | Pattern |
+| --- | --- | --- |
+| Find the User class | `find_entities(p, "User", entity_types=["class"])` | exact ID, then qualified name, then name; `partial=True` adds case-insensitive "contains" matches |
+| Everything about an entity | `get_entity`, `get_entity_context` | entity + parent + neighbors both ways |
+| What is connected to User? | `get_neighbors` | `(start)-[r]->(other)` and `(start)<-[r]-(other)`, all types |
+| What methods does User have? | `get_contained_entities` | `-[:CONTAINS]->`; `max_depth` > 1 for nested definitions |
+| Who calls User.save? / What does login call? | `get_callers` / `get_callees` | `<-[:CALLS]-` / `-[:CALLS]->` |
+| What does auth.py import? / Who imports user.py? | `get_imports` / `get_importers` | `-[:IMPORTS]->` / `<-[:IMPORTS]-` |
+| What does auth.py depend on (indirectly)? | `get_dependencies` / `get_transitive_dependencies(max_depth=3)` | `-[:DEPENDS_ON]->` / `-[:DEPENDS_ON*1..3]->` |
+| What depends on user.py? | `get_dependents(max_depth=1)` | `<-[:DEPENDS_ON*1..N]-` |
+| What does Admin inherit from? / Who inherits from User? | `get_parents` / `get_subclasses` | `-[:INHERITS]->` / `<-[:INHERITS]-` |
+| What does UserService implement? / Who implements IService? | `get_implemented_interfaces` / `get_implementations` | `-[:IMPLEMENTS]->` / `<-[:IMPLEMENTS]-` |
+| How is login connected to User.save? | `find_paths(max_depth=4, directed=True)` | `allShortestPaths((source)-[*1..4]->(target))` |
+
+IMPORTS and DEPENDS_ON link files (Phase 5), so those operations take a file ID; asked about a
+class, they return an empty list. For example, "who calls `User.save`?":
+
+```cypher
+MATCH (start:Entity {id: $entity_id, project_id: $project_id})
+      <-[r:CALLS]-(other:Entity {project_id: $project_id})
+WHERE $entity_types IS NULL OR other.entity_type IN $entity_types
+RETURN properties(other) AS entity, type(r) AS type, properties(r) AS relationship,
+       startNode(r).id AS source_id, endNode(r).id AS target_id
+ORDER BY type(r), other.file_path, other.start_line, other.id
+LIMIT $limit
+```
+
+**Search and ambiguity:** entities sharing a name (three `run` methods) are all returned, exact
+matches ranked before partial ones, then sorted by qualified name and path. The caller chooses;
+nothing is picked at random. **Not found vs. nothing found:** an empty result about an existing
+entity is an empty list; if the entity itself does not exist, a second, cheap lookup turns the
+empty result into `EntityNotFoundError` (so the common case costs one query).
+
+### Project isolation
+
+- The project ID must be 32 hexadecimal characters (the workspace rule), else
+  `ProjectNotFoundError` before any query.
+- Entity IDs always start with `<project_id>:` (Phase 4). An ID without the project's prefix is
+  "not found" without asking Neo4j, so another project's entity cannot be reached, even by
+  mistake.
+- Every query matches its nodes with `{project_id: $project_id}`: the start node, the node at
+  the other end of each relationship and, for multi-hop traversals and paths, every node of the
+  path (`all(n IN nodes(path) WHERE n.project_id = $project_id)`), even though Phase 6 never
+  links two projects.
+
+### Depth and limits
+
+Cypher cannot take the bounds of a variable-length pattern as parameters, so `*1..3` is part of
+the query text. `traversal_depth()` only lets through an `int` from 1 to `MAX_TRAVERSAL_DEPTH`
+(5; booleans, strings and floats are refused), and the service turns bad values into a 400
+first. There is never an unbounded `[:DEPENDS_ON*]`: the number of paths a variable-length
+pattern visits can grow exponentially with its length. Multi-hop results list each entity once,
+at its shortest distance (`min(length(path))`). `find_paths` returns the shortest paths only
+(`allShortestPaths`), sorted by the IDs along them, so the same question always gets the same
+answer. Every query ends with `LIMIT $limit`; `get_neighbors` applies the limit per direction.
+Every query starts with an index seek (the `id` constraint or the `project_id` index): no new
+index was needed.
+
+### Security
+
+The Phase 6 rules apply: values are parameters (`$project_id`, `$entity_id`, `$text`,
+`$entity_types`, `$limit`); labels and relationship types come from the `schema.py` whitelists
+(sorted, so a set of types always gives the same query), directions from the `Direction` enum and
+depths from `traversal_depth()`. There is no "run this Cypher" method; retrieval queries are
+read-only and run in read transactions.
+
+### Testing
+
+`tests/test_graph_retrieval.py` writes a small Java project (`tests/retrieval_helpers.py`) into
+two projects with the real `GraphBuilder`, on the fake driver, and checks every operation,
+ordering, ambiguity, depth and limits, isolation, not-found cases, invalid arguments, malicious
+values and error translation, plus one project analyzed from real Python sources by Phases 3-5.
+`tests/graph_fakes.py` answers the retrieval queries in memory, and only accepts a query that is
+exactly the text the repository's builder produces. `pytest -m neo4j` asks every question of
+`retrieval_helpers.QUESTIONS` to a real Neo4j and to the fake, and requires identical answers.
+
+Not in Phase 7, on purpose: HTTP endpoints for retrieval (they will come with the phase that
+uses them), vector search, and anything LLM-related.
 
 ## Future packages
 
-New packages (`rag/`, `llm/`) are added only when the phase that needs them is reached. Graph
-retrieval (Phase 7) will build on `graph/`.
+New packages (`rag/`, `llm/`) are added only when the phase that needs them is reached. GraphRAG
+(Phase 9) will combine `GraphRetrievalService` with vector search (Phase 8).

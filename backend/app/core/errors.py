@@ -53,6 +53,18 @@ class SourceFileError(AppError):
     status_code = 422
 
 
+class EntityNotFoundError(AppError):
+    """No entity with this ID in the project's knowledge graph."""
+
+    status_code = 404
+
+
+class InvalidGraphQueryError(AppError):
+    """A graph retrieval request with invalid parameters (depth, limit, search text...)."""
+
+    status_code = 400
+
+
 class GraphDatabaseError(AppError):
     """A Neo4j operation failed (a transaction, a query, a constraint...)."""
 

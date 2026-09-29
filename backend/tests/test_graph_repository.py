@@ -6,8 +6,15 @@ from app.extraction.models import EntityType
 from app.graph import schema
 from app.graph.client import Neo4jClient
 from app.graph.models import GraphEdge, GraphNode
+from app.graph import repository as queries
+from app.graph.models import Direction
 from app.graph.repository import (
+    MAX_TRAVERSAL_DEPTH,
     GraphRepository,
+    paths_query,
+    reachable_query,
+    related_query,
+    traversal_depth,
     upsert_nodes_query,
     upsert_relationships_query,
 )
@@ -191,3 +198,102 @@ def test_statistics_count_nodes_and_relationships_of_one_project() -> None:
 def test_batch_size_must_be_positive() -> None:
     with pytest.raises(ValueError):
         make_repository(FakeNeo4j(), batch_size=0)
+
+
+# ----- Retrieval queries -----
+
+
+def retrieval_queries() -> list[str]:
+    return [
+        queries.GET_ENTITY,
+        queries.FIND_ENTITIES,
+        related_query(["CALLS"], Direction.INCOMING),
+        related_query(schema.RELATIONSHIP_TYPES, Direction.OUTGOING),
+        reachable_query(["DEPENDS_ON"], Direction.OUTGOING, 3),
+        reachable_query(["CONTAINS"], Direction.INCOMING, MAX_TRAVERSAL_DEPTH),
+        paths_query(None, 4, directed=True),
+        paths_query(["CALLS", "USES"], 2, directed=False),
+    ]
+
+
+def test_every_retrieval_query_is_scoped_by_project_and_read_only() -> None:
+    for query in retrieval_queries():
+        assert "project_id: $project_id" in query
+        for keyword in ("MERGE", "CREATE", "DELETE", "SET ", "REMOVE", "CALL "):
+            assert keyword not in query
+    for query in retrieval_queries()[1:]:
+        assert "LIMIT $limit" in query
+
+
+def test_retrieval_queries_check_both_ends_and_every_node_of_a_path() -> None:
+    related = related_query(["CALLS"], Direction.OUTGOING)
+    assert "(start:Entity {id: $entity_id, project_id: $project_id})" in related
+    assert "(other:Entity {project_id: $project_id})" in related
+    reachable = reachable_query(["DEPENDS_ON"], Direction.OUTGOING, 3)
+    for query in (reachable, paths_query(None, 4, directed=True)):
+        assert "all(n IN nodes(path) WHERE n.project_id = $project_id)" in query
+
+
+def test_directions_and_types_shape_the_pattern() -> None:
+    assert "-[r:CALLS]->(other" in related_query(["CALLS"], Direction.OUTGOING)
+    assert "<-[r:CALLS]-(other" in related_query(["CALLS"], Direction.INCOMING)
+    # Sorted and deduplicated: the same set of types always gives the same query.
+    assert "[r:CALLS|USES]" in related_query(["USES", "CALLS", "USES"], Direction.OUTGOING)
+    assert "-[:DEPENDS_ON*1..3]->(other" in reachable_query(["DEPENDS_ON"], Direction.OUTGOING, 3)
+    assert "(source)-[*1..4]->(target)" in paths_query(None, 4, directed=True)
+    assert "(source)-[:CALLS*1..2]-(target)" in paths_query(["CALLS"], 2, directed=False)
+
+
+def test_traversals_are_never_unbounded() -> None:
+    for query in retrieval_queries():
+        assert "*]" not in query and "*1..]" not in query
+    assert traversal_depth(1) == 1 and traversal_depth(MAX_TRAVERSAL_DEPTH) == MAX_TRAVERSAL_DEPTH
+    for bad in [0, -1, MAX_TRAVERSAL_DEPTH + 1, True, "3", "3] DETACH DELETE n //", 2.0, None]:
+        with pytest.raises(ValueError):
+            traversal_depth(bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            reachable_query(["CALLS"], Direction.OUTGOING, bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            paths_query(None, bad, directed=True)  # type: ignore[arg-type]
+
+
+def test_retrieval_queries_only_accept_known_types_and_directions() -> None:
+    for bad_types in [["Hacker"], ["CALLS]->() DETACH DELETE n //"], ["calls"], []]:
+        with pytest.raises(ValueError):
+            related_query(bad_types, Direction.OUTGOING)
+        with pytest.raises(ValueError):
+            reachable_query(bad_types, Direction.OUTGOING, 2)
+        with pytest.raises(ValueError):
+            paths_query(bad_types, 2, directed=True)
+    with pytest.raises(ValueError):
+        related_query(["CALLS"], "both")  # type: ignore[arg-type]
+
+
+def full_node(project_id: str, name: str) -> GraphNode:
+    """A node with every property Phase 6 writes, as retrieval reads them back."""
+    short_node = node(project_id, name)
+    properties = {
+        **short_node.properties, "qualified_name": name, "file_path": "a.py",
+        "language": "python", "start_line": 1, "start_column": 1, "end_line": 2,
+        "end_column": 1, "parent_id": f"{project_id}:a.py",
+    }  # fmt: skip
+    return GraphNode(short_node.id, short_node.label, properties)
+
+
+def test_repository_reads_send_values_as_parameters() -> None:
+    database = FakeNeo4j()
+    repository = make_repository(database)
+    a, b = full_node(PROJECT_A, "a"), full_node(PROJECT_A, MALICIOUS)
+    repository.upsert_nodes([a, b], build_id="1")
+    repository.upsert_relationships(PROJECT_A, [edge(a, b)], build_id="1")
+    database.queries.clear()
+
+    callees = repository.get_callees(PROJECT_A, a.id, limit=10)
+
+    assert [c.entity.id for c in callees] == [b.id]
+    assert [c.entity.name for c in callees] == [MALICIOUS]
+    [(query, parameters)] = database.queries
+    assert parameters == {
+        "project_id": PROJECT_A, "entity_id": a.id, "entity_types": None, "limit": 10,
+    }  # fmt: skip
+    assert MALICIOUS not in query

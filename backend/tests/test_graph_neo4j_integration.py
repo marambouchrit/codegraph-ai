@@ -15,10 +15,14 @@ from collections.abc import Iterator
 import pytest
 
 from app.core.config import Settings
+from app.core.errors import EntityNotFoundError
 from app.graph.builder import GraphBuilder
 from app.graph.client import Neo4jClient
 from app.graph.repository import GraphRepository
+from app.services.graph_retrieval_service import GraphRetrievalService
+from tests.graph_fakes import FakeNeo4j, fake_driver_factory
 from tests.relationship_helpers import analyze
+from tests.retrieval_helpers import QUESTIONS, SAVE, full, java_report
 
 pytestmark = pytest.mark.neo4j
 
@@ -101,3 +105,44 @@ def test_projects_are_isolated(
     assert count(client, NODES, project_a) == 0
     assert count(client, NODES, project_b) == nodes_b
     assert repository.statistics(project_b).node_count == nodes_b
+
+
+# ----- Graph retrieval (Phase 7) -----
+
+
+def test_retrieval_gives_the_same_answers_as_the_fake(
+    repository: GraphRepository, project_ids: list[str]
+) -> None:
+    """Every retrieval question, asked to a real Neo4j and to the test fake.
+
+    The fake runs the unit tests; this proves its answers (content, order, limits)
+    are the ones the real Cypher gives.
+    """
+    project_a, project_b = project_ids
+    fake_client = Neo4jClient("bolt://localhost:7687", "neo4j", "", "neo4j",
+                              driver_factory=fake_driver_factory(FakeNeo4j()))  # fmt: skip
+    fake_repository = GraphRepository(fake_client)
+    for target in (repository, fake_repository):
+        GraphBuilder(target).build(java_report(project_a))
+    GraphBuilder(repository).build(java_report(project_b))  # a neighbour that must not leak
+
+    real, fake = GraphRetrievalService(repository), GraphRetrievalService(fake_repository)
+    for name, question in QUESTIONS.items():
+        assert question(real, project_a) == question(fake, project_a), name
+
+
+def test_retrieval_is_isolated_on_a_real_server(
+    repository: GraphRepository, project_ids: list[str]
+) -> None:
+    project_a, project_b = project_ids
+    GraphBuilder(repository).build(java_report(project_a))
+    GraphBuilder(repository).build(java_report(project_b))
+    service = GraphRetrievalService(repository)
+
+    found = service.find_entities(project_a, "User", partial=True, limit=200)
+    callers = service.get_callers(project_a, full(project_a, SAVE))
+
+    assert found and {e.project_id for e in found} == {project_a}
+    assert callers and {c.entity.project_id for c in callers} == {project_a}
+    with pytest.raises(EntityNotFoundError):
+        service.get_callers(project_a, full(project_b, SAVE))

@@ -3,9 +3,14 @@
 `GraphNode` and `GraphEdge` are what the builder sends to the repository: plain
 data, already in the shape Neo4j stores. `GraphBuildReport` and `GraphStatistics`
 are what the graph layer returns to its callers.
+
+The retrieval models (`EntityResult`, `RelationshipResult`, `RelatedEntity`,
+`GraphPath`, `GraphContext`) are what graph retrieval (Phase 7) reads back: never
+raw Neo4j records.
 """
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 # Values Neo4j can store as properties: strings, numbers, booleans (None removes a property).
@@ -68,3 +73,126 @@ class GraphStatistics:
     @property
     def relationship_count(self) -> int:
         return sum(self.relationships_by_type.values())
+
+
+# ----- Retrieval (Phase 7) -----
+
+
+class Direction(StrEnum):
+    """Which way a relationship is followed from the entity asked about."""
+
+    OUTGOING = "outgoing"  # (entity)-[r]->(other): what the entity calls, imports...
+    INCOMING = "incoming"  # (other)-[r]->(entity): who calls it, who imports it...
+
+
+@dataclass(frozen=True)
+class EntityResult:
+    """One node of the knowledge graph, as stored by Phase 6."""
+
+    id: str
+    entity_type: str  # "file", "class", "interface", "function" or "method"
+    name: str
+    qualified_name: str
+    project_id: str
+    file_path: str
+    language: str
+    start_line: int
+    start_column: int
+    end_line: int
+    end_column: int
+    parent_id: str | None = None  # None for files
+
+    @classmethod
+    def from_properties(cls, properties: Properties) -> "EntityResult":
+        return cls(
+            id=properties["id"],
+            entity_type=properties["entity_type"],
+            name=properties["name"],
+            qualified_name=properties["qualified_name"],
+            project_id=properties["project_id"],
+            file_path=properties["file_path"],
+            language=properties["language"],
+            start_line=int(properties["start_line"]),
+            start_column=int(properties["start_column"]),
+            end_line=int(properties["end_line"]),
+            end_column=int(properties["end_column"]),
+            parent_id=properties.get("parent_id"),
+        )
+
+
+@dataclass(frozen=True)
+class RelationshipResult:
+    """One edge of the knowledge graph. CONTAINS edges have no source location."""
+
+    id: str
+    type: str  # "CALLS", "IMPORTS"... or "CONTAINS"
+    source_id: str
+    target_id: str
+    file_path: str | None = None  # where the relationship was first seen (Phase 5)
+    line: int | None = None
+    column: int | None = None
+
+    @classmethod
+    def from_record(
+        cls, type_: str, properties: Properties, source_id: str, target_id: str
+    ) -> "RelationshipResult":
+        line, column = properties.get("line"), properties.get("column")
+        return cls(
+            id=properties["id"],
+            type=type_,
+            source_id=source_id,
+            target_id=target_id,
+            file_path=properties.get("file_path"),
+            line=None if line is None else int(line),
+            column=None if column is None else int(column),
+        )
+
+
+@dataclass(frozen=True)
+class RelatedEntity:
+    """An entity reached from the entity asked about, and how it was reached.
+
+    One hop: `relationship` is the edge followed and `depth` is 1. Several hops
+    (transitive dependencies, nested containment): `relationship` is None and `depth`
+    is the length of the shortest chain; use find_paths() to see the chain itself.
+    """
+
+    entity: EntityResult
+    direction: Direction
+    depth: int = 1
+    relationship: RelationshipResult | None = None
+
+
+@dataclass(frozen=True)
+class GraphPath:
+    """A chain of relationships: nodes[i] and nodes[i + 1] are linked by relationships[i]."""
+
+    nodes: tuple[EntityResult, ...]
+    relationships: tuple[RelationshipResult, ...]
+
+    @property
+    def length(self) -> int:
+        return len(self.relationships)
+
+
+@dataclass(frozen=True)
+class GraphContext:
+    """An entity with its parent and its direct neighbors, in both directions."""
+
+    entity: EntityResult
+    parent: EntityResult | None
+    neighbors: tuple[RelatedEntity, ...]
+
+    @property
+    def entities(self) -> list[EntityResult]:
+        """Every distinct entity of the context, the entity itself first."""
+        found = {self.entity.id: self.entity}
+        if self.parent is not None:
+            found.setdefault(self.parent.id, self.parent)
+        for neighbor in self.neighbors:
+            found.setdefault(neighbor.entity.id, neighbor.entity)
+        return list(found.values())
+
+    @property
+    def relationships(self) -> list[RelationshipResult]:
+        return [n.relationship for n in self.neighbors if n.relationship is not None]

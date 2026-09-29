@@ -11,6 +11,12 @@ It reproduces the meaning of the queries that matters for the tests:
 - deletions are limited to one project and to `$limit` items per query.
 Real MERGE semantics are checked against a real server by the optional
 `test_graph_neo4j_integration.py` tests.
+
+It also answers the read-only retrieval queries (Phase 7): entity lookup and
+search, one-hop neighbors, bounded multi-hop reachability and shortest paths,
+with the same filters (project, entity types), order and limits as the Cypher.
+A generated query is only accepted if it is exactly the text the repository's
+query builder produces for the types, direction and depth read back from it.
 """
 
 import re
@@ -19,8 +25,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.graph import repository as queries
+from app.graph.models import Direction
 
 Row = dict[str, Any]
+
+_RELATED = re.compile(r"\(start:Entity \{[^}]*\}\)(<-|-)\[r:([A-Z_|]+)\](->|-)\(other")
+_REACHABLE = re.compile(
+    r"MATCH path = \(start:Entity \{[^}]*\}\)(<-|-)\[:([A-Z_|]+)\*1\.\.(\d+)\](->|-)\(other"
+)
+_PATHS = re.compile(
+    r"allShortestPaths\(\(source\)-\[(?::([A-Z_|]+))?\*1\.\.(\d+)\](->|-)\(target\)\)"
+)
 
 
 @dataclass
@@ -75,6 +90,25 @@ class FakeNeo4j:
             return self._count_nodes(parameters)
         if query == queries.COUNT_RELATIONSHIPS_BY_TYPE:
             return self._count_relationships(parameters)
+        if query == queries.GET_ENTITY:
+            node = self._project_node(parameters["entity_id"], parameters)
+            return [{"entity": dict(node.properties)}] if node is not None else []
+        if query == queries.FIND_ENTITIES:
+            return self._find_entities(parameters)
+        if match := _REACHABLE.search(query):
+            direction = _direction(match.group(1), match.group(4))
+            types, depth = match.group(2).split("|"), int(match.group(3))
+            assert query == queries.reachable_query(types, direction, depth)
+            return self._reachable(types, direction, depth, parameters)
+        if match := _RELATED.search(query):
+            direction, types = _direction(match.group(1), match.group(3)), match.group(2).split("|")
+            assert query == queries.related_query(types, direction)
+            return self._related(types, direction, parameters)
+        if match := _PATHS.search(query):
+            path_types = match.group(1).split("|") if match.group(1) else None
+            depth, directed = int(match.group(2)), match.group(3) == "->"
+            assert query == queries.paths_query(path_types, depth, directed)
+            return self._paths(path_types, depth, directed, parameters)
         raise AssertionError(f"FakeNeo4j does not understand this query:\n{query}")
 
     # ----- Helpers for assertions -----
@@ -160,6 +194,154 @@ class FakeNeo4j:
     def _in_project(self, node_id: str, parameters: dict[str, Any]) -> bool:
         node = self.nodes.get(node_id)
         return node is not None and node.properties.get("project_id") == parameters["project_id"]
+
+    # ----- Retrieval query implementations -----
+
+    def _project_node(self, node_id: str, parameters: dict[str, Any]) -> StoredNode | None:
+        return self.nodes[node_id] if self._in_project(node_id, parameters) else None
+
+    def _type_allowed(self, node_id: str, parameters: dict[str, Any]) -> bool:
+        allowed = parameters["entity_types"]
+        return allowed is None or self.nodes[node_id].properties["entity_type"] in allowed
+
+    def _find_entities(self, parameters: dict[str, Any]) -> list[Row]:
+        text = parameters["text"]
+
+        def rank(properties: dict[str, Any]) -> int | None:
+            if properties["id"] == text:
+                return 0
+            if properties["qualified_name"] == text:
+                return 1
+            if properties["name"] == text:
+                return 2
+            if parameters["partial"] and text.lower() in properties["qualified_name"].lower():
+                return 3
+            return None
+
+        found = []
+        for node_id, node in self.nodes.items():
+            if not self._in_project(node_id, parameters):
+                continue
+            node_rank = rank(node.properties)
+            if node_rank is not None and self._type_allowed(node_id, parameters):
+                p = node.properties
+                found.append(((node_rank, p["qualified_name"], p["file_path"], p["id"]), p))
+        found.sort(key=lambda item: item[0])
+        return [{"entity": dict(p)} for _, p in found[: parameters["limit"]]]
+
+    def _steps(
+        self, node_id: str, types: list[str] | None, directions: tuple[Direction, ...]
+    ) -> list[tuple[StoredRelationship, str]]:
+        """(relationship, node at its other end) for each relationship followed from node_id."""
+        steps = []
+        for relationship in self.relationships.values():
+            if types is not None and relationship.type not in types:
+                continue
+            if Direction.OUTGOING in directions and relationship.source_id == node_id:
+                steps.append((relationship, relationship.target_id))
+            elif Direction.INCOMING in directions and relationship.target_id == node_id:
+                steps.append((relationship, relationship.source_id))
+        return steps
+
+    def _related(
+        self, types: list[str], direction: Direction, parameters: dict[str, Any]
+    ) -> list[Row]:
+        start = parameters["entity_id"]
+        if self._project_node(start, parameters) is None:
+            return []
+        found = []
+        for relationship, other_id in self._steps(start, types, (direction,)):
+            if not self._in_project(other_id, parameters):
+                continue
+            if not self._type_allowed(other_id, parameters):
+                continue
+            other = self.nodes[other_id].properties
+            key = (relationship.type, other["file_path"], other["start_line"], other_id)
+            row = {
+                "entity": dict(other),
+                "type": relationship.type,
+                "relationship": dict(relationship.properties),
+                "source_id": relationship.source_id,
+                "target_id": relationship.target_id,
+            }
+            found.append((key, row))
+        found.sort(key=lambda item: item[0])
+        return [row for _, row in found[: parameters["limit"]]]
+
+    def _reachable(
+        self, types: list[str], direction: Direction, max_depth: int, parameters: dict[str, Any]
+    ) -> list[Row]:
+        """Breadth-first search: the first time a node is reached is its shortest depth."""
+        start = parameters["entity_id"]
+        if self._project_node(start, parameters) is None:
+            return []
+        depths: dict[str, int] = {start: 0}
+        frontier = [start]
+        for depth in range(1, max_depth + 1):
+            next_frontier = []
+            for node_id in frontier:
+                for _, other_id in self._steps(node_id, types, (direction,)):
+                    if other_id not in depths and self._in_project(other_id, parameters):
+                        depths[other_id] = depth
+                        next_frontier.append(other_id)
+            frontier = next_frontier
+        found = []
+        for node_id, depth in depths.items():
+            if node_id == start or not self._type_allowed(node_id, parameters):
+                continue
+            p = self.nodes[node_id].properties
+            found.append(((depth, p["file_path"], p["start_line"], node_id), p, depth))
+        found.sort(key=lambda item: item[0])
+        return [{"entity": dict(p), "depth": d} for _, p, d in found[: parameters["limit"]]]
+
+    def _paths(
+        self, types: list[str] | None, max_depth: int, directed: bool, parameters: dict[str, Any]
+    ) -> list[Row]:
+        """All the shortest paths (allShortestPaths) from source to target."""
+        source, target = parameters["source_id"], parameters["target_id"]
+        if self._project_node(source, parameters) is None:
+            return []
+        if self._project_node(target, parameters) is None:
+            return []
+        directions = (
+            (Direction.OUTGOING,) if directed else (Direction.OUTGOING, Direction.INCOMING)
+        )
+        paths: list[tuple[list[str], list[StoredRelationship]]] = []
+        layer: list[tuple[list[str], list[StoredRelationship]]] = [([source], [])]
+        for _ in range(max_depth):
+            next_layer = []
+            for node_ids, edges in layer:
+                for relationship, other_id in self._steps(node_ids[-1], types, directions):
+                    if other_id in node_ids or not self._in_project(other_id, parameters):
+                        continue
+                    next_layer.append((node_ids + [other_id], edges + [relationship]))
+            paths = [path for path in next_layer if path[0][-1] == target]
+            if paths:
+                break  # shortest length found: longer paths are not shortest paths
+            layer = next_layer
+        paths.sort(key=lambda path: (path[0], [edge.properties["id"] for edge in path[1]]))
+        return [
+            {
+                "nodes": [dict(self.nodes[node_id].properties) for node_id in node_ids],
+                "relationships": [
+                    {
+                        "type": edge.type,
+                        "properties": dict(edge.properties),
+                        "source_id": edge.source_id,
+                        "target_id": edge.target_id,
+                    }
+                    for edge in edges
+                ],
+            }
+            for node_ids, edges in paths[: parameters["limit"]]
+        ]
+
+
+def _direction(left: str, right: str) -> Direction:
+    if (left, right) == ("-", "->"):
+        return Direction.OUTGOING
+    assert (left, right) == ("<-", "-"), (left, right)
+    return Direction.INCOMING
 
 
 def _set_properties(properties: dict[str, Any], new: dict[str, Any]) -> None:

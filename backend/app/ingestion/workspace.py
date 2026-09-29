@@ -24,6 +24,10 @@ def new_project_id() -> str:
     return uuid.uuid4().hex
 
 
+def is_valid_project_id(project_id: object) -> bool:
+    return isinstance(project_id, str) and _PROJECT_ID_PATTERN.fullmatch(project_id) is not None
+
+
 class Workspace:
     def __init__(self, base_dir: Path) -> None:
         self.base_dir = base_dir.resolve()
@@ -31,7 +35,7 @@ class Workspace:
     def project_dir(self, project_id: str) -> Path:
         # Project IDs come from URLs, so validate them before building a path.
         # This makes values such as "../../etc" impossible.
-        if not _PROJECT_ID_PATTERN.fullmatch(project_id):
+        if not is_valid_project_id(project_id):
             raise ProjectNotFoundError(f"Project '{project_id}' not found.")
         return self.base_dir / project_id
 

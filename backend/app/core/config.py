@@ -44,10 +44,15 @@ class Settings(BaseSettings):
     # Empty for the local Docker Qdrant (no authentication); set it for a secured server.
     qdrant_api_key: SecretStr = SecretStr("")
     # One collection for all projects: every point carries its project_id (see app/rag/).
-    qdrant_collection: str = "codegraph_chunks"
+    # A collection holds the vectors of one model: named after it, so that changing the model
+    # (and this name) starts a new collection instead of touching the old one.
+    qdrant_collection: str = "codegraph_chunks_bge_m3"
     qdrant_timeout_seconds: int = 10
     # Any sentence-transformers model from Hugging Face, run locally (no API key, no cloud).
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # The vector dimension is read from the model (BAAI/bge-m3: 1024), never configured.
+    embedding_model: str = "BAAI/bge-m3"
+    # Where the model runs: "cpu" (default, works everywhere), "cuda" or "mps" for a GPU.
+    embedding_device: str = "cpu"
     # Chunks embedded (and sent to Qdrant) together.
     embedding_batch_size: int = 32
     # Chunks longer than this are split on line boundaries (about 4 characters per token).

@@ -18,12 +18,15 @@ and no model code is executed (trust_remote_code=False).
 """
 
 import logging
+import math
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from functools import lru_cache
 from typing import Any
 
+from app.core.config import Settings
 from app.core.errors import EmbeddingModelError
 
 logger = logging.getLogger(__name__)
@@ -58,12 +61,12 @@ class EmbeddingProvider(ABC):
 ModelLoader = Callable[[str], Any]
 
 
-def load_sentence_transformer(model_name: str) -> Any:
+def load_sentence_transformer(model_name: str, device: str = "cpu") -> Any:
     # Imported here: it loads PyTorch, which takes seconds, and only indexing and
     # search need it (the API and the other tests start without it).
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(model_name, trust_remote_code=False)
+    return SentenceTransformer(model_name, device=device, trust_remote_code=False)
 
 
 class SentenceTransformerEmbeddings(EmbeddingProvider):
@@ -74,7 +77,8 @@ class SentenceTransformerEmbeddings(EmbeddingProvider):
         model_name: str,
         batch_size: int = 32,
         query_prefix: str | None = None,
-        loader: ModelLoader = load_sentence_transformer,
+        loader: ModelLoader | None = None,
+        device: str = "cpu",
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
@@ -83,7 +87,8 @@ class SentenceTransformerEmbeddings(EmbeddingProvider):
         if query_prefix is None:
             query_prefix = QUERY_PREFIXES.get(model_name, "")
         self.query_prefix = query_prefix
-        self._loader = loader
+        self.device = device
+        self._loader = loader or (lambda name: load_sentence_transformer(name, device))
         self._model: Any = None
         self._lock = threading.Lock()  # two first requests at once must not load it twice
 
@@ -118,17 +123,22 @@ class SentenceTransformerEmbeddings(EmbeddingProvider):
         return self._encode([self.query_prefix + text])[0]
 
     def _load(self) -> Any:
-        logger.info("Loading embedding model %s", self._model_name)
+        logger.info("Loading embedding model %s on %s", self._model_name, self.device)
+        started = time.perf_counter()
         try:
-            return self._loader(self._model_name)
+            model = self._loader(self._model_name)
         except Exception as error:
             # The library's message may be long (HTTP details...): log its type only.
             logger.error("Could not load embedding model %s: %s", self._model_name,
                          type(error).__name__)  # fmt: skip
             raise EmbeddingModelError(
-                f"The embedding model '{self._model_name}' could not be loaded: check "
-                "EMBEDDING_MODEL, and that it was downloaded once (Hugging Face cache)."
+                f"The embedding model '{self._model_name}' could not be loaded on "
+                f"'{self.device}': check EMBEDDING_MODEL and EMBEDDING_DEVICE, and that the "
+                "model could be downloaded once (network, disk space, Hugging Face cache)."
             ) from error
+        logger.info("Embedding model %s loaded in %.1f s", self._model_name,
+                    time.perf_counter() - started)  # fmt: skip
+        return model
 
     def _encode(self, texts: list[str]) -> list[Vector]:
         model = self.model
@@ -146,12 +156,25 @@ class SentenceTransformerEmbeddings(EmbeddingProvider):
         except Exception as error:
             logger.error("Embedding failed: %s", type(error).__name__)  # never log the code
             raise EmbeddingModelError("The embedding model failed to embed the text.") from error
-        if len(result) != len(texts) or any(len(vector) != self.dimension for vector in result):
+        dimension = self.dimension
+        if len(result) != len(texts) or any(len(vector) != dimension for vector in result):
             raise EmbeddingModelError("The embedding model returned vectors of the wrong shape.")
+        # NaN or infinity would be stored in Qdrant and silently break every score.
+        if not all(math.isfinite(value) for vector in result for value in vector):
+            raise EmbeddingModelError("The embedding model returned non-finite values.")
         return result
 
 
 @lru_cache(maxsize=4)
-def get_embedding_provider(model_name: str, batch_size: int = 32) -> EmbeddingProvider:
-    """One provider (so one loaded model) per model name for the whole process."""
-    return SentenceTransformerEmbeddings(model_name, batch_size=batch_size)
+def get_embedding_provider(
+    model_name: str, batch_size: int = 32, device: str = "cpu"
+) -> EmbeddingProvider:
+    """One provider (so one loaded model) per model and device for the whole process."""
+    return SentenceTransformerEmbeddings(model_name, batch_size=batch_size, device=device)
+
+
+def embedding_provider_from_settings(settings: Settings) -> EmbeddingProvider:
+    """The provider for EMBEDDING_MODEL / EMBEDDING_BATCH_SIZE / EMBEDDING_DEVICE."""
+    return get_embedding_provider(
+        settings.embedding_model, settings.embedding_batch_size, settings.embedding_device
+    )

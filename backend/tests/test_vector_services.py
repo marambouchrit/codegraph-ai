@@ -218,6 +218,84 @@ def test_another_model_dimension_is_refused(
         indexer(settings, store, HashingEmbeddings(dimension=128)).index_project(project.id)
 
 
+# ----- Changing the embedding model -----
+
+
+def chunk_ids(store: QdrantVectorStore, embeddings: Any, project_id: str) -> set[str]:
+    hits = retriever(store, embeddings).retrieve(project_id, "user password token", top_k=50)
+    return {hit.chunk.id for hit in hits}
+
+
+def test_reindexing_with_a_new_model_replaces_the_old_vectors(
+    settings: Settings, make_zip: MakeZip, store: QdrantVectorStore
+) -> None:
+    old, new = HashingEmbeddings(model_name="old/model"), HashingEmbeddings(model_name="new/model")
+    project = import_project(settings, make_zip, AUTH_PROJECT)
+    first = indexer(settings, store, old).index_project(project.id)
+    before = chunk_ids(store, old, project.id)
+
+    assert retriever(store, new).retrieve(project.id, "password") == []  # never mixed
+    report = indexer(settings, store, new).index_project(project.id)
+
+    # Same chunks (IDs, metadata) under the new model; the old model's points are gone.
+    assert report.chunks == first.chunks and report.stale_chunks_deleted == first.chunks
+    assert store.count(project.id) == report.chunks
+    assert chunk_ids(store, new, project.id) == before
+    assert retriever(store, old).retrieve(project.id, "password") == []
+    [hit] = retriever(store, new).retrieve(project.id, "verify password hash", top_k=1)
+    assert (hit.chunk.file_path, hit.chunk.start_line) != ("", 0)
+    assert hit.chunk.entity_id.startswith(f"{project.id}:")
+
+
+def test_a_failed_reindexing_with_a_new_model_keeps_the_old_index(
+    settings: Settings, make_zip: MakeZip, store: QdrantVectorStore
+) -> None:
+    old = HashingEmbeddings(model_name="old/model")
+    project = import_project(settings, make_zip, AUTH_PROJECT)
+    indexer(settings, store, old).index_project(project.id)
+    before = chunk_ids(store, old, project.id)
+
+    settings.embedding_batch_size = 4
+    failing = FailingEmbeddings(fail_after=8, model_name="new/model")
+    with pytest.raises(EmbeddingModelError):
+        indexer(settings, store, failing).index_project(project.id)
+
+    # Two batches were written for the new model, next to (not over) the old points.
+    assert chunk_ids(store, old, project.id) == before
+
+
+def test_index_all_projects(
+    settings: Settings, make_zip: MakeZip, store: QdrantVectorStore, embeddings: HashingEmbeddings
+) -> None:
+    first = import_project(settings, make_zip, AUTH_PROJECT)
+    second = import_project(settings, make_zip, AUTH_PROJECT)
+    service = indexer(settings, store, embeddings)
+    chunk_project = service.chunk_project
+
+    def broken_first(project_id: str) -> Any:
+        if project_id == first.id:
+            raise ProjectNotFoundError("Project files are missing.")
+        return chunk_project(project_id)
+
+    service.chunk_project = broken_first  # type: ignore[method-assign]
+    reports, failures = service.index_all_projects()
+
+    # One project failing does not stop the others.
+    assert [r.project_id for r in reports] == [second.id]
+    assert failures == {first.id: "Project files are missing."}
+    assert store.count(second.id) == reports[0].chunks and store.count(first.id) == 0
+
+
+def test_index_all_projects_stops_when_the_model_is_missing(
+    settings: Settings, make_zip: MakeZip, store: QdrantVectorStore
+) -> None:
+    import_project(settings, make_zip, AUTH_PROJECT)
+    import_project(settings, make_zip, AUTH_PROJECT)
+
+    with pytest.raises(EmbeddingModelError):  # would fail the same way for every project
+        indexer(settings, store, FailingEmbeddings()).index_all_projects()
+
+
 def test_files_that_cannot_be_parsed_are_counted_not_fatal(
     settings: Settings, make_zip: MakeZip, store: QdrantVectorStore, embeddings: HashingEmbeddings
 ) -> None:

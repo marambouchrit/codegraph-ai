@@ -20,7 +20,7 @@ on old and new points until the next successful indexing.
 Usage (the store owns the Qdrant connection, so close it when done):
 
     with QdrantVectorStore.from_settings(settings) as store:
-        embeddings = get_embedding_provider(settings.embedding_model)
+        embeddings = embedding_provider_from_settings(settings)
         report = VectorIndexService(settings, store, embeddings).index_project(project_id)
         print(report.summary)
 """
@@ -32,6 +32,12 @@ from collections.abc import Iterator, Sequence
 from typing import TypeVar
 
 from app.core.config import Settings
+from app.core.errors import (
+    AppError,
+    EmbeddingModelError,
+    VectorCollectionError,
+    VectorStoreUnavailableError,
+)
 from app.extraction.models import ExtractionReport, FileEntities
 from app.extraction.service import EntityExtractionService
 from app.parsing.base import ParseResult
@@ -121,6 +127,25 @@ class VectorIndexService:
         )
         logger.info("Project %s: %s", project_id, report.summary)
         return report
+
+    def index_all_projects(self) -> tuple[list[VectorIndexReport], dict[str, str]]:
+        """Index every imported project, e.g. after changing EMBEDDING_MODEL.
+
+        One project failing never stops the others, and never deletes its previous points
+        (see index_project). Returns the reports and, per failed project ID, the error.
+        Qdrant down or the model missing fails on the first project, before any write.
+        """
+        reports: list[VectorIndexReport] = []
+        failures: dict[str, str] = {}
+        for project in self.project_service.list_projects():
+            try:
+                reports.append(self.index_project(project.id))
+            except (VectorStoreUnavailableError, EmbeddingModelError, VectorCollectionError):
+                raise  # would fail the same way for every project
+            except AppError as error:
+                logger.error("Project %s could not be indexed: %s", project.id, error.message)
+                failures[project.id] = error.message
+        return reports, failures
 
     def delete_project_index(self, project_id: str) -> int:
         """Remove one project's vectors (other projects are untouched). Returns the count."""

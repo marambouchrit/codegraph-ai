@@ -15,7 +15,7 @@ code is *connected*. Phase 9 combines both.
 Usage:
 
     with QdrantVectorStore.from_settings(settings) as store:
-        embeddings = get_embedding_provider(settings.embedding_model)
+        embeddings = embedding_provider_from_settings(settings)
         retrieval = VectorRetrievalService(store, embeddings, settings)
         for hit in retrieval.retrieve(project_id, "How are users authenticated?"):
             print(hit.score, hit.chunk.qualified_name, hit.chunk.file_path, hit.chunk.start_line)

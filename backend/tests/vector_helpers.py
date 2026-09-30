@@ -66,8 +66,8 @@ class HashingEmbeddings(EmbeddingProvider):
 class FailingEmbeddings(HashingEmbeddings):
     """Loads fine, then fails to embed documents after `fail_after` of them."""
 
-    def __init__(self, fail_after: int = 0) -> None:
-        super().__init__()
+    def __init__(self, fail_after: int = 0, model_name: str = "test/hashing") -> None:
+        super().__init__(model_name=model_name)
         self.fail_after = fail_after
 
     def embed_documents(self, texts: Sequence[str]) -> list[Vector]:

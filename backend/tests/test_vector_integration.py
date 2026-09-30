@@ -10,6 +10,7 @@ The `embeddings` end-to-end test checks semantic search without any shared words
 """
 
 import io
+import math
 import uuid
 from collections.abc import Iterator
 
@@ -17,7 +18,7 @@ import pytest
 from qdrant_client import QdrantClient
 
 from app.core.config import Settings
-from app.rag.embeddings import SentenceTransformerEmbeddings, get_embedding_provider
+from app.rag.embeddings import SentenceTransformerEmbeddings, embedding_provider_from_settings
 from app.rag.vector_store import QdrantVectorStore
 from app.services.project_service import ProjectService
 from app.services.vector_index_service import VectorIndexService
@@ -97,9 +98,13 @@ def test_the_same_answers_as_the_in_memory_qdrant(
 # ----- Real embedding model -----
 
 
+# Dimensions published on the model cards, to catch a model that is not the one expected.
+KNOWN_DIMENSIONS = {"BAAI/bge-m3": 1024, "BAAI/bge-small-en-v1.5": 384}
+
+
 @pytest.fixture(scope="module")
 def model() -> SentenceTransformerEmbeddings:
-    provider = get_embedding_provider(Settings().embedding_model)
+    provider = embedding_provider_from_settings(Settings())
     assert isinstance(provider, SentenceTransformerEmbeddings)
     return provider
 
@@ -109,9 +114,29 @@ def test_real_model_dimension_and_normalized_vectors(model: SentenceTransformerE
     [document] = model.embed_documents(["def login(username, password): ..."])
     query = model.embed_query("where do users log in?")
 
+    assert model.model_name == Settings().embedding_model
     assert len(document) == len(query) == model.dimension
+    if model.model_name in KNOWN_DIMENSIONS:
+        assert model.dimension == KNOWN_DIMENSIONS[model.model_name]
+    assert all(math.isfinite(v) for v in document + query)
     assert abs(sum(v * v for v in document) - 1.0) < 1e-3
+    assert abs(sum(v * v for v in query) - 1.0) < 1e-3
     assert model.embed_documents(["def login(username, password): ..."])[0] == pytest.approx(document)
+
+
+@pytest.mark.embeddings
+def test_real_model_batches_give_the_same_vectors(model: SentenceTransformerEmbeddings) -> None:
+    texts = [
+        "def login(username, password): ...",
+        "class Database:\n    def query(self, table, key): ...",
+        "export function cartTotal(items: Item[]): number { return 0 }",
+    ]
+    batch = model.embed_documents(texts)
+
+    assert len(batch) == len(texts) and model.embed_documents([]) == []
+    for text, vector in zip(texts, batch, strict=True):
+        # Padding in a batch changes the last float digits only.
+        assert model.embed_documents([text])[0] == pytest.approx(vector, abs=1e-3)
 
 
 @pytest.mark.embeddings

@@ -91,6 +91,20 @@ def test_a_collection_of_another_dimension_is_refused(store: QdrantVectorStore) 
     assert "384" in error.value.message and "QDRANT_COLLECTION" in error.value.message
 
 
+def test_a_query_of_another_dimension_is_refused_clearly(
+    store: QdrantVectorStore, embeddings: HashingEmbeddings
+) -> None:
+    index(store, [make_chunk(PROJECT_A, name, text) for name, text in AUTH], embeddings)
+    # A second store on the same collection (another process): it reads the dimension.
+    other = QdrantVectorStore(store.client, store.collection)
+
+    for current in (store, other):
+        with pytest.raises(VectorCollectionError) as error:
+            current.search(PROJECT_A, [1.0] * 1024, embedding_model=MODEL, limit=5)
+        assert "256" in error.value.message and "1024" in error.value.message
+    assert search(store, embeddings, PROJECT_A, "jwt token")[0] == "create_token"
+
+
 @pytest.mark.parametrize("name", ["", "a b", "../x", "x" * 65, "chunks;drop", None])
 def test_collection_names_are_validated(name: Any) -> None:
     with pytest.raises(VectorCollectionError):
@@ -133,9 +147,11 @@ def test_same_chunk_twice_is_one_point(store: QdrantVectorStore, embeddings: Has
 def test_point_ids_are_deterministic_uuids() -> None:
     chunk_id = f"{PROJECT_A}:src/a.py:login|1"
 
-    assert point_id(chunk_id) == point_id(chunk_id)
-    assert point_id(chunk_id) != point_id(chunk_id.replace("|1", "|2"))
-    assert uuid.UUID(point_id(chunk_id)).version == 5
+    assert point_id(chunk_id, MODEL) == point_id(chunk_id, MODEL)
+    assert point_id(chunk_id, MODEL) != point_id(chunk_id.replace("|1", "|2"), MODEL)
+    assert uuid.UUID(point_id(chunk_id, MODEL)).version == 5
+    # Another model gets other points: a new model never overwrites the old model's vectors.
+    assert point_id(chunk_id, "BAAI/bge-m3") != point_id(chunk_id, MODEL)
 
 
 def test_delete_stale_keeps_the_current_indexing(

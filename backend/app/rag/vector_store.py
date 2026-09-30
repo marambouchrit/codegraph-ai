@@ -3,7 +3,7 @@
 One collection holds every project (Qdrant's recommended multitenancy layout):
 
     collection "codegraph_chunks"  (vectors of `dimension` floats, cosine distance)
-      point  id      = uuid5(chunk ID)           deterministic: re-indexing overwrites
+      point  id      = uuid5(model + chunk ID)   deterministic: re-indexing overwrites
              vector  = embedding of the chunk
              payload = chunk metadata and source text, plus
                        project_id       every search, count and delete filters on it
@@ -55,9 +55,14 @@ KEYWORD_FIELDS = ("embedding_model", "index_id", "language", "entity_type")
 SCORE_DECIMALS = 6  # float32 carries about 7 significant digits
 
 
-def point_id(chunk_id: str) -> str:
-    """Qdrant IDs must be integers or UUIDs: a UUID derived from the chunk ID."""
-    return str(uuid.uuid5(POINT_ID_NAMESPACE, chunk_id))
+def point_id(chunk_id: str, embedding_model: str) -> str:
+    """Qdrant IDs must be integers or UUIDs: a UUID derived from the model and chunk ID.
+
+    With the model in the ID, indexing with a new model never overwrites the old model's
+    points: until the new indexing succeeds (and removes them as stale), searches with
+    the old model still find every chunk.
+    """
+    return str(uuid.uuid5(POINT_ID_NAMESPACE, f"{embedding_model}\n{chunk_id}"))
 
 
 @dataclass(frozen=True)
@@ -77,6 +82,7 @@ class QdrantVectorStore:
         self.client = client
         self.collection = collection
         self.location = location or "Qdrant"  # shown in error messages, never with a key
+        self._checked_dimension: int | None = None  # the collection's, once read or created
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "QdrantVectorStore":
@@ -133,14 +139,15 @@ class QdrantVectorStore:
                         self.collection, field_name=field,
                         field_schema=models.PayloadSchemaType.KEYWORD,
                     )  # fmt: skip
+            self._checked_dimension = dimension
             return
         info = self.collection_info()
-        if info.dimension != dimension or info.distance != DISTANCE.value:
+        if info.distance != DISTANCE.value:
             raise VectorCollectionError(
-                f"The Qdrant collection '{self.collection}' holds {info.dimension}-dimension "
-                f"{info.distance} vectors, but the embedding model produces {dimension}-dimension "
-                "vectors: set another QDRANT_COLLECTION, or delete the collection and re-index."
+                f"The Qdrant collection '{self.collection}' uses {info.distance} distance, not "
+                f"{DISTANCE.value}: it was not created by CodeGraph AI."
             )
+        self._check_dimension(info.dimension, dimension)
 
     def collection_info(self) -> CollectionInfo:
         with self.qdrant_errors():
@@ -174,7 +181,7 @@ class QdrantVectorStore:
             return 0
         points = [
             models.PointStruct(
-                id=point_id(chunk.id),
+                id=point_id(chunk.id, embedding_model),
                 vector=list(vector),
                 payload={
                     **chunk.to_payload(),
@@ -225,6 +232,11 @@ class QdrantVectorStore:
         """
         if not self.collection_exists():
             return []
+        # A query vector of another dimension (the model changed, the collection did not):
+        # a clear error rather than Qdrant's HTTP 400.
+        if self._checked_dimension is None:
+            self._checked_dimension = self.collection_info().dimension
+        self._check_dimension(self._checked_dimension, len(vector))
         query_filter = _filter(
             project_id, embedding_model=embedding_model,
             languages=languages, entity_types=entity_types,
@@ -252,6 +264,15 @@ class QdrantVectorStore:
         return sorted(results, key=lambda result: (-result.score, result.chunk.id))
 
     # ----- Helpers -----
+
+    def _check_dimension(self, collection_dimension: int, dimension: int) -> None:
+        if collection_dimension != dimension:
+            raise VectorCollectionError(
+                f"The Qdrant collection '{self.collection}' holds {collection_dimension}-dimension "
+                f"vectors, but the embedding model produces {dimension}-dimension vectors: set "
+                "another QDRANT_COLLECTION and re-index the projects (see docs/architecture.md)."
+            )
+        self._checked_dimension = collection_dimension
 
     def _delete(self, points_filter: models.Filter) -> int:
         if not self.collection_exists():

@@ -4,15 +4,19 @@ The real model is tested by the optional `pytest -m embeddings` tests
 (test_vector_integration.py): these tests never download anything.
 """
 
+import math
 import threading
 from typing import Any
 
 import pytest
 
+from app.core.config import Settings
 from app.core.errors import EmbeddingModelError
+from app.rag import embeddings as embeddings_module
 from app.rag.embeddings import (
     QUERY_PREFIXES,
     SentenceTransformerEmbeddings,
+    embedding_provider_from_settings,
     get_embedding_provider,
 )
 from tests.vector_helpers import HashingEmbeddings
@@ -21,10 +25,17 @@ from tests.vector_helpers import HashingEmbeddings
 class FakeModel:
     """Mimics SentenceTransformer.encode(): records its calls, returns unit vectors."""
 
-    def __init__(self, dimension: int = 4, broken: bool = False, wrong_shape: bool = False):
+    def __init__(
+        self,
+        dimension: int = 4,
+        broken: bool = False,
+        wrong_shape: bool = False,
+        not_finite: bool = False,
+    ):
         self.dimension = dimension
         self.broken = broken
         self.wrong_shape = wrong_shape
+        self.not_finite = not_finite
         self.calls: list[dict[str, Any]] = []
 
     def get_sentence_embedding_dimension(self) -> int:
@@ -35,7 +46,8 @@ class FakeModel:
         if self.broken:
             raise RuntimeError("CUDA out of memory: SECRET SOURCE CODE")
         size = self.dimension + (1 if self.wrong_shape else 0)
-        return [[1.0] + [0.0] * (size - 1) for _ in texts]
+        first = math.nan if self.not_finite else 1.0
+        return [[first] + [0.0] * (size - 1) for _ in texts]
 
 
 def provider(model: FakeModel, name: str = "BAAI/bge-small-en-v1.5", **kwargs: Any):
@@ -139,6 +151,62 @@ def test_vectors_of_the_wrong_shape_are_rejected() -> None:
         embeddings.embed_query("q")
 
 
+def test_non_finite_vectors_are_rejected() -> None:
+    embeddings, _ = provider(FakeModel(not_finite=True))
+
+    with pytest.raises(EmbeddingModelError):
+        embeddings.embed_documents(["def f(): ..."])
+
+
+def test_the_model_is_loaded_on_the_configured_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    loads: list[tuple[str, str]] = []
+
+    def fake_load(model_name: str, device: str = "cpu") -> FakeModel:
+        loads.append((model_name, device))
+        return FakeModel()
+
+    monkeypatch.setattr(embeddings_module, "load_sentence_transformer", fake_load)
+    SentenceTransformerEmbeddings("BAAI/bge-m3").embed_query("q")
+    SentenceTransformerEmbeddings("BAAI/bge-m3", device="cuda").embed_query("q")
+
+    assert loads == [("BAAI/bge-m3", "cpu"), ("BAAI/bge-m3", "cuda")]
+
+
+def test_a_device_failure_names_the_setting() -> None:
+    def loader(_name: str) -> Any:
+        raise RuntimeError("Torch not compiled with CUDA enabled")
+
+    embeddings = SentenceTransformerEmbeddings("BAAI/bge-m3", loader=loader, device="cuda")
+
+    with pytest.raises(EmbeddingModelError) as error:
+        embeddings.embed_query("q")
+    assert "EMBEDDING_DEVICE" in error.value.message and "'cuda'" in error.value.message
+
+
+def test_the_default_model_is_bge_m3_on_the_cpu() -> None:
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.embedding_model == "BAAI/bge-m3"
+    assert settings.embedding_device == "cpu"
+    # Its own collection: vectors of another model are never searched or overwritten.
+    assert settings.qdrant_collection == "codegraph_chunks_bge_m3"
+    assert QUERY_PREFIXES.get(settings.embedding_model) is None  # BGE-M3 needs no instruction
+
+
+def test_the_provider_follows_the_settings() -> None:
+    settings = Settings(
+        embedding_model="some/model-for-settings-test", embedding_batch_size=8,
+        embedding_device="cuda",
+    )  # fmt: skip
+    embeddings = embedding_provider_from_settings(settings)
+
+    assert isinstance(embeddings, SentenceTransformerEmbeddings)
+    assert (embeddings.model_name, embeddings.batch_size, embeddings.device) == (
+        "some/model-for-settings-test", 8, "cuda",
+    )  # fmt: skip
+    assert embedding_provider_from_settings(settings) is embeddings  # one model per process
+
+
 def test_batch_size_is_validated() -> None:
     with pytest.raises(ValueError):
         SentenceTransformerEmbeddings("m", batch_size=0)
@@ -148,6 +216,7 @@ def test_one_provider_per_model_for_the_whole_process() -> None:
     first = get_embedding_provider("some/model-for-cache-test")
     assert get_embedding_provider("some/model-for-cache-test") is first
     assert get_embedding_provider("other/model-for-cache-test") is not first
+    assert get_embedding_provider("some/model-for-cache-test", device="cuda") is not first
 
 
 def test_test_embeddings_are_consistent_and_normalized() -> None:

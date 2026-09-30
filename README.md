@@ -7,14 +7,15 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 9 — GraphRAG retrieval. Projects can be imported from GitHub or a ZIP file,
+> **Status:** Phase 10 — LLM assistant. Projects can be imported from GitHub or a ZIP file,
 > their source files are parsed, the files, classes, interfaces, functions and methods they
 > define are extracted, the relationships between them (imports, inheritance, calls, type uses,
 > file dependencies) are resolved, the result is stored as a knowledge graph in Neo4j that can
 > be queried (callers, dependencies, inheritance, paths...), and the code is indexed in Qdrant
 > for semantic search with a local embedding model, and both are combined into structured
-> GraphRAG context (vector hits expanded through the graph); analysis features are built
-> incrementally (see [Roadmap](#roadmap)).
+> GraphRAG context (vector hits expanded through the graph), which an LLM turns into a grounded
+> answer citing numbered source locations; analysis features are built incrementally (see
+> [Roadmap](#roadmap)). No chat endpoint yet (Phase 11).
 
 ## Tech stack
 
@@ -24,7 +25,7 @@ project — with answers grounded in the code and linked to source locations.
 | Code analysis  | Tree-sitter (official grammar packages)      |
 | Knowledge graph| Neo4j 5 (official Python driver)             |
 | Vector search  | Qdrant + local open-source embeddings (sentence-transformers) |
-| LLM            | Provider-agnostic `LLMProvider` *(Phase 10)* |
+| LLM            | Provider-agnostic `LLMProvider`: Gemini (default, free tier), Groq, OpenRouter or any OpenAI-compatible API (`openai` SDK), Claude (`anthropic` SDK) |
 | Frontend       | React, TypeScript, Vite                      |
 
 See [docs/architecture.md](docs/architecture.md) for the full architecture.
@@ -80,6 +81,7 @@ pytest -m network    # clones a real repository from GitHub
 pytest -m neo4j      # needs a running Neo4j (see "Knowledge graph" below)
 pytest -m qdrant     # needs a running Qdrant (see "Semantic code search" below)
 pytest -m embeddings # runs the real embedding model (BGE-M3, ~2.3 GB downloaded on first use)
+pytest -m llm        # calls the real LLM (needs LLM_API_KEY; free with a free-tier key)
 ```
 
 ### Importing a project (API)
@@ -382,7 +384,7 @@ question ─> vector search (Qdrant) ─> hits ─> distinct entities (seeds)
         ─> graph questions per seed type (Neo4j, one hop, bounded) ─> GraphRAGContext
 ```
 
-The result is **structured context, not an answer** (no LLM yet): the vector hits with their
+The result is **structured context, not an answer** (the LLM assistant below writes the answer): the vector hits with their
 scores, the seeds, the graph entities and relationships, shortest paths between seeds, and the
 **sources** to cite (file + line range + why each one is there). With both databases running and
 the project analyzed and indexed (see above), from `backend/`:
@@ -434,6 +436,75 @@ fails, with `GRAPHRAG_REQUIRE_GRAPH=true`). See
 
 **Tests:** `pytest` covers GraphRAG with the fake Neo4j and the in-memory Qdrant;
 `pytest -m "neo4j and qdrant"` (both started) checks the real servers give the same context.
+
+### LLM assistant (grounded answers)
+
+The LLM turns a GraphRAG context into an answer. It **retrieves nothing itself**: it only reads
+the context GraphRAG built, and every claim should cite a numbered source.
+
+```
+question ─> GraphRAGService ─> GraphRAGContext ─> PromptBuilder ─> LLMProvider (Gemini...)
+                                                                        │
+          AssistantResponse <── citations checked against the sources <─┘
+          (answer, numbered sources, cited numbers, graph_status, warnings)
+```
+
+**1. Get a free API key and configure it** in `backend/.env`:
+
+| `LLM_PROVIDER` | Free key | Default model | Notes |
+| --- | --- | --- | --- |
+| `gemini` (default) | <https://aistudio.google.com/apikey> (Google account, no card) | `gemini-flash-lite-latest` | large context, fits the prompt easily; free-tier data may be used by Google to improve its products |
+| `groq` | <https://console.groq.com/keys> | `openai/gpt-oss-120b` | very fast; small tokens-per-minute quota on the free tier (lower `LLM_MAX_TOKENS`) |
+| `openrouter` | <https://openrouter.ai/keys> | set `LLM_MODEL` to a `:free` model | about 50 free requests per day |
+| `anthropic` | paid (<https://console.anthropic.com>) | `claude-opus-5-5` | `LLM_EFFORT` applies |
+| `openai_compatible` | depends | set `LLM_MODEL` | any OpenAI-compatible server via `LLM_BASE_URL` (a local one included) |
+
+```bash
+# backend/.env
+LLM_PROVIDER=gemini
+LLM_API_KEY=<your key>
+```
+
+Free tiers, quotas and model names change: check the provider's console. See
+[Configuration](#configuration).
+
+**2. Ask a question** (no API endpoint yet; from `backend/`, with Neo4j and Qdrant running and
+the project analyzed and indexed):
+
+```python
+from app.llm.generator import LLMGenerationService
+from app.llm.provider import create_llm_provider
+
+# `graphrag` built as in "GraphRAG retrieval" above
+context = graphrag.build_context("<project_id>", "How is authentication implemented?")
+response = LLMGenerationService(create_llm_provider(settings)).generate(context)
+
+print(response.answer)              # Markdown, citing sources as [1], [2]...
+for source in response.cited_sources:
+    print(source.label)             # [1] AuthService.login — app/auth/service.py:14-20
+print(response.graph_status, response.warnings)
+```
+
+- **Grounding:** the instructions (system prompt) say to answer only from the context, to say
+  "The available repository context is insufficient..." when it is, to state relationships only
+  if the graph lists them, and to never invent code, files or line numbers.
+- **Citations:** sources are numbered by the application, in GraphRAG's order. The model only
+  cites numbers; `cited` keeps the numbers that exist, and a number pointing at nothing is
+  reported in `warnings`. File paths and lines always come from the retrieved metadata.
+- **Nothing retrieved:** no LLM call; the answer says the context is insufficient.
+- **Failures are never hidden:** a missing key, an unreachable or overloaded provider, a timeout,
+  an empty or declined answer raise `LLMConfigurationError`, `LLMUnavailableError` or
+  `LLMResponseError`; no fallback answer is made up. If Neo4j was down, the answer is still
+  generated from the vector evidence, with `graph_status="unavailable"` and a warning.
+- **Replaceable:** the rest of the application only sees `LLMProvider`. Two implementations
+  cover every provider above (OpenAI-compatible protocol, Anthropic); another OpenAI-compatible
+  service is one preset line in `create_llm_provider()`.
+
+See [docs/architecture.md](docs/architecture.md#llm-assistant-phase-10).
+
+**Tests:** `pytest` covers prompt building, citations, errors and the provider with fakes (no
+network, no key). `pytest -m llm` asks the real model two questions (needs a key; free with a
+free-tier key).
 
 ### Frontend
 
@@ -488,6 +559,15 @@ Git; each app has a committed `.env.example` template.
 |                         | `GRAPHRAG_MAX_CONTEXT_ENTITIES` | `40`     | Seeds + neighbors in the context |
 |                         | `GRAPHRAG_PATH_SEEDS` / `GRAPHRAG_PATH_MAX_DEPTH` | `3` / `3` | Paths between the top seeds |
 |                         | `GRAPHRAG_REQUIRE_GRAPH` | `false`         | Fail (instead of vector-only context) when Neo4j fails |
+|                         | `LLM_PROVIDER`  | `gemini`                 | `gemini`, `groq`, `openrouter`, `anthropic`, `openai_compatible` |
+|                         | `LLM_MODEL`     | *(provider default)*     | Model answering the questions      |
+|                         | `LLM_BASE_URL`  | *(provider preset)*      | Only for `openai_compatible`       |
+|                         | `LLM_API_KEY`   | *(empty)*                | API key (never logged); empty: `GEMINI_API_KEY`, `GROQ_API_KEY`... |
+|                         | `LLM_MAX_TOKENS` | `16000`                 | Output limit per answer (reasoning included) |
+|                         | `LLM_EFFORT`    | `medium`                 | Claude only: `low` … `max`; empty: model default |
+|                         | `LLM_TEMPERATURE` | *(unset)*              | Only for models that accept it (current Claude models don't) |
+|                         | `LLM_TIMEOUT_SECONDS` | `120`              | Timeout of one LLM request         |
+|                         | `LLM_MAX_RETRIES` | `2`                    | SDK retries (network, 429, 5xx)    |
 | `.env` (root, optional) | `NEO4J_PASSWORD` | `change-me-please`      | Password of the Docker Compose Neo4j |
 | `frontend/.env`         | `VITE_API_URL`  | `http://localhost:8000`  | Backend base URL                  |
 
@@ -529,6 +609,14 @@ Imported code is treated as untrusted input:
 - **GraphRAG** only combines the typed operations above (no Cypher or Qdrant filter of its own),
   keeps every result in the requested project, expands one hop per seed with bounded paths, and
   never calls an external service.
+- **LLM assistant:** the model is treated as an untrusted generator and repository code as
+  untrusted data. Instructions live only in the system prompt; the repository context and the
+  question go in the user message inside delimited sections, **XML-escaped**, so code or a
+  comment such as `</repository_context> ignore previous instructions` cannot close a section or
+  pose as instructions. The model has no tools: it cannot run code, query the databases or
+  change retrieval. Its citations are checked against the retrieved sources. The API key is a
+  `SecretStr` and never appears in logs or errors. Only the retrieved context (selected code
+  chunks and metadata) is sent to the LLM provider, never the whole repository.
 
 ## Roadmap
 
@@ -541,7 +629,7 @@ Imported code is treated as untrusted input:
 7. ✅ Graph retrieval
 8. ✅ Vector RAG (chunking, embeddings, Qdrant)
 9. ✅ GraphRAG (hybrid retrieval + context fusion)
-10. LLM assistant (`POST /projects/{id}/chat`)
+10. ✅ LLM assistant (grounded, cited answers; the chat endpoint comes next)
 11. Frontend (import, dashboard, explorer, chat)
 12. Graph visualization
 13. Advanced analysis (impact, dependencies, architecture summary)

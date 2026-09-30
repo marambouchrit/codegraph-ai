@@ -36,7 +36,7 @@ from app.graph.models import (
     RelatedEntity,
 )
 from app.graph.repository import MAX_TRAVERSAL_DEPTH, GraphRepository
-from app.graph.schema import RELATIONSHIP_TYPES
+from app.graph.schema import CONTAINS, RELATIONSHIP_TYPES
 from app.ingestion.workspace import is_valid_project_id
 
 DEFAULT_LIMIT = 50  # entities returned by one question
@@ -137,6 +137,13 @@ class GraphRetrievalService:
             lambda p, e: self.repository.get_contained_entities(
                 p, e, limit=limit, max_depth=depth, entity_types=types
             ),
+        )  # fmt: skip
+
+    def get_container(self, project_id: str, entity_id: str) -> list[RelatedEntity]:
+        """The class or file defining this entity, with the CONTAINS edge (empty for a file)."""
+        return self._related(
+            project_id, entity_id,
+            lambda p, e: self.repository.get_related(p, e, [CONTAINS], Direction.INCOMING, limit=1),
         )  # fmt: skip
 
     # ----- Calls -----

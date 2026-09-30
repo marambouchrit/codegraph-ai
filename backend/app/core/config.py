@@ -59,6 +59,22 @@ class Settings(BaseSettings):
     # Results scoring below this are dropped. None: no threshold (see docs/architecture.md).
     vector_min_score: float | None = None
 
+    # --- GraphRAG (vector hits expanded in the knowledge graph) ---
+    # Vector hits retrieved per question (at most VECTOR_MAX_TOP_K): the context's chunks.
+    graphrag_vector_top_k: int = 10
+    # Distinct entities of those hits expanded in the graph, best first.
+    graphrag_max_seeds: int = 5
+    # Neighbors kept per graph question (callers, callees...) and per seed.
+    graphrag_neighbors_per_expansion: int = 5
+    # Seeds and neighbors in the final context (seeds are always kept first).
+    graphrag_max_context_entities: int = 40
+    # Shortest paths are searched between the first N seeds (0: none), up to this depth.
+    graphrag_path_seeds: int = 3
+    graphrag_path_max_depth: int = 3
+    # True: a Neo4j failure fails the request. False: return the vector evidence alone,
+    # with graph_status "unavailable" or "partial" and a warning.
+    graphrag_require_graph: bool = False
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

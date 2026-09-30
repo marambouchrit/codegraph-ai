@@ -599,3 +599,15 @@ def test_retrieval_on_an_analyzed_python_project() -> None:
     [path] = service.find_paths(PROJECT_A, auth.id, save.id)
     assert [n.name for n in path.nodes] == ["auth.py", "login", "save"]
     assert [r.type for r in path.relationships] == ["CONTAINS", "CALLS"]
+
+
+def test_container(service: GraphRetrievalService) -> None:
+    [user] = service.get_container(PROJECT_A, a(SAVE))
+
+    assert short(user.entity.id) == USER
+    assert user.relationship is not None and user.relationship.type == "CONTAINS"
+    assert user.direction == Direction.INCOMING
+    assert ids(service.get_container(PROJECT_A, a(USER))) == [USER_FILE]
+    assert service.get_container(PROJECT_A, a(USER_FILE)) == []  # a file has no container
+    with pytest.raises(EntityNotFoundError):
+        service.get_container(PROJECT_A, full(PROJECT_B, SAVE))

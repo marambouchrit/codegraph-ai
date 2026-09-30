@@ -37,16 +37,17 @@ Question → query analysis
 | Repository manager | Clone / extract / scan repositories                 | ✅ Phase 2 |
 | Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (3), entities (4), relationships (5) |
 | Graph engine       | Neo4j storage and graph queries                     | ✅ Storage (6), retrieval (7) |
-| RAG engine         | Chunking, embeddings, Qdrant, hybrid retrieval      | Phases 8–9 |
+| RAG engine         | Chunking, embeddings, Qdrant, hybrid retrieval      | ✅ Vector search (8), GraphRAG (9) |
 | Chat engine        | Prompting and LLM provider abstraction              | Phase 10 |
 
-## Current backend layout (Phase 7)
+## Current backend layout (Phase 9)
 
 ```
 backend/app/
 ├── main.py                  # create_app(): FastAPI instance, CORS, error handler, routers
 ├── core/
 │   ├── config.py            # Settings loaded from environment / .env
+│   ├── urls.py              # safe_uri(): server URLs without credentials
 │   ├── errors.py            # AppError + subclasses, each with an HTTP status code
 │   └── logging.py           # logging setup
 ├── api/
@@ -58,7 +59,10 @@ backend/app/
 ├── services/                # orchestration: the only places combining the packages below
 │   ├── project_service.py   # ingestion: workspace, clone/ZIP, scan, project.json
 │   ├── graph_service.py     # knowledge graph: analysis (Phases 3-5) -> Neo4j
-│   └── graph_retrieval_service.py  # graph retrieval: validation, defaults, "not found"
+│   ├── graph_retrieval_service.py  # graph retrieval: validation, defaults, "not found"
+│   ├── vector_index_service.py     # vector index: files -> chunks -> embeddings -> Qdrant
+│   ├── vector_retrieval_service.py # semantic search: validation, top_k, filters
+│   └── graphrag_service.py  # GraphRAG: vector hits -> seeds -> graph expansion -> context
 ├── ingestion/               # small, independent building blocks
 │   ├── github.py            # URL validation + safe shallow `git clone`
 │   ├── zip_handler.py       # safe ZIP extraction
@@ -91,18 +95,27 @@ backend/app/
 │   ├── modules.py           # ModuleIndex: import -> project file (Python, JS/TS, Java packages)
 │   ├── resolver.py          # ReferenceResolver: name -> entity, shared by all languages
 │   └── service.py           # RelationshipExtractionService: collect per file, then resolve
-└── graph/                   # Neo4j knowledge graph (Phase 6); no Tree-sitter, no FastAPI
-    ├── client.py            # Neo4jClient: driver, sessions, transactions, error translation
-    ├── schema.py            # labels, relationship types, constraint/index (whitelists)
-    ├── models.py            # GraphNode, GraphEdge, GraphBuildReport, GraphStatistics,
-    │                        # retrieval results: EntityResult, RelatedEntity, GraphPath...
-    ├── repository.py        # GraphRepository: all the Cypher (writes, stats, retrieval reads)
-    └── builder.py           # GraphBuilder: RelationshipReport -> nodes and edges
+├── graph/                   # Neo4j knowledge graph (Phase 6); no Tree-sitter, no FastAPI
+│   ├── client.py            # Neo4jClient: driver, sessions, transactions, error translation
+│   ├── schema.py            # labels, relationship types, constraint/index (whitelists)
+│   ├── models.py            # GraphNode, GraphEdge, GraphBuildReport, GraphStatistics,
+│   │                        # retrieval results: EntityResult, RelatedEntity, GraphPath...
+│   ├── repository.py        # GraphRepository: all the Cypher (writes, stats, retrieval reads)
+│   └── builder.py           # GraphBuilder: RelationshipReport -> nodes and edges
+├── rag/                     # vector search (Phase 8); no Neo4j, no FastAPI
+│   ├── models.py            # CodeChunk, ChunkSearchResult, VectorIndexReport
+│   ├── chunker.py           # CodeChunker: source + entities -> code-aware chunks
+│   ├── embeddings.py        # EmbeddingProvider, SentenceTransformerEmbeddings (local)
+│   └── vector_store.py      # QdrantVectorStore: collection, upsert, search, deletes
+└── graphrag/                # GraphRAG (Phase 9): uses graph/ and rag/ models, no queries
+    ├── models.py            # GraphRAGContext, Seed, ContextEntity, ContextRelationship, Source
+    └── expansion.py         # which graph questions to ask per seed type
 ```
 
 Dependencies point one way: `routes → services → ingestion`, `parsing → ingestion`,
-`relationships → extraction → parsing → ingestion` and `services → graph → relationships`
-(`graph/` only consumes Phase 4–5 data: it never parses code). None of these layers knows anything
+`relationships → extraction → parsing → ingestion`, `services → graph → relationships` and
+`services → rag → extraction` (`graph/` only consumes Phase 4–5 data: it never parses code;
+`rag/` never imports `graph/`; `graphrag/` uses both). None of these layers knows anything
 about FastAPI, so they are easy to test and to reuse in later phases.
 
 ## Ingestion pipeline (Phase 2)
@@ -548,7 +561,305 @@ exactly the text the repository's builder produces. `pytest -m neo4j` asks every
 Not in Phase 7, on purpose: HTTP endpoints for retrieval (they will come with the phase that
 uses them), vector search, and anything LLM-related.
 
+## Vector RAG (Phase 8)
+
+**Why:** the knowledge graph answers *how code is connected* ("who calls `authenticate()`?"),
+but not *where something is done* when the question does not name the code: "how is
+authentication implemented?" names no class or function. Vector search finds code whose
+*meaning* is close to the question, even without shared words. It does not replace the graph:
+it cannot say who calls what. Phase 9 combines both.
+
+```
+Repository ─> Phase 2 files ─> Phase 3 ParserService ─> Phase 4 EntityExtractionService
+                                     (one parse per file, on_file callback)
+                                                   │ source bytes + entities
+                                                   ▼
+                                  CodeChunker            app/rag/chunker.py
+                                                   │ CodeChunk (text + metadata)
+                                                   ▼
+                                  EmbeddingProvider      app/rag/embeddings.py (local model)
+                                                   │ normalized vectors
+                                                   ▼
+                                  QdrantVectorStore      app/rag/vector_store.py
+                                                   │
+                                                   ▼
+                                               Qdrant
+                                                   ▲
+            question ─> VectorRetrievalService ─> embed_query ─> search (project filter)
+```
+
+`VectorIndexService` (indexing) and `VectorRetrievalService` (search) live in `app/services/`,
+next to the graph services; `app/rag/` holds the building blocks and never imports `app/graph/`.
+The source files are the source of truth: nothing is read from Neo4j. The link to the graph is
+the chunk's `entity_id`: it is the Phase 4 entity ID, which is also the Neo4j node ID.
+
+### Chunking strategy
+
+Chunks follow the Phase 4 entity tree instead of cutting every N characters (which would split
+functions in half and glue unrelated code together):
+
+| Unit | Chunk text |
+| --- | --- |
+| Function, method | its full source, decorators/annotations included; functions and classes defined inside it stay in it |
+| Class, interface | a **skeleton**: the class with each member that has its own chunk collapsed to its signature and `...` (fields, docstrings, signatures stay) |
+| File | module-level code (imports, constants, scripts) with each top-level definition collapsed; no file chunk when a file only holds definitions |
+
+Every line of code is in exactly one chunk body; only signatures are repeated as context. An
+entity already shown whole by its parent (a one-line method, `interface Listener { void
+changed(); }`) gets no chunk of its own. A chunk longer than `VECTOR_CHUNK_MAX_CHARS` (2000,
+about 500 tokens: the input limit of bge-small) is split on line boundaries into parts that
+repeat `VECTOR_CHUNK_OVERLAP_LINES` (3) lines; a longer single line (minified code) is cut.
+Files with syntax errors are chunked like the others (Phase 4 still extracts their well-formed
+definitions); unreadable files are counted in the report. What is embedded is the chunk text
+after a short header built from the metadata (`python method AuthService.login` / `file:
+app/auth/service.py`): paths and entity kinds carry meaning the code alone may not.
+
+### Embedding model
+
+`EmbeddingProvider` (`model_name`, `dimension`, `embed_documents`, `embed_query`) hides the
+model; `SentenceTransformerEmbeddings` runs any sentence-transformers model locally. The model
+is loaded on first use, once per process (`get_embedding_provider()`, thread-safe), with
+`trust_remote_code=False`. No code leaves the machine and no API key is needed.
+
+Default: **`BAAI/bge-small-en-v1.5`** (384 dimensions, ~130 MB, 512 input tokens). `BAAI/bge-m3`
+(1024 dimensions, ~2.3 GB, 8192 tokens, multilingual) was the first candidate; on a laptop CPU it
+indexes about 15× slower for little gain on function-sized English/code chunks, so it is one
+setting away (`EMBEDDING_MODEL=BAAI/bge-m3`, with another `QDRANT_COLLECTION`) rather than the
+default. Documents and queries use the **same model** (vectors of two models live in unrelated
+spaces); bge v1.5 models expect a short instruction before queries only, which the provider adds.
+The dimension is never hard-coded: the collection is created from `EmbeddingProvider.dimension`.
+
+**Distance:** cosine. Vectors are normalized, the similarity the bge models are trained for;
+scores range from -1 to 1, higher is closer.
+
+### Qdrant
+
+One collection (`QDRANT_COLLECTION`, default `codegraph_chunks`) for every project, Qdrant's
+recommended layout for many tenants. Each point:
+
+| Part | Content |
+| --- | --- |
+| ID | `uuid5(chunk ID)`: Qdrant IDs must be UUIDs or integers |
+| Vector | the chunk's embedding |
+| Payload | `chunk_id`, `project_id`, `file_path`, `language`, `entity_id`, `entity_type`, `name`, `qualified_name`, `start_line`, `end_line`, `text`, `part`, `part_count`, `embedding_model`, `index_id` |
+
+The payload keeps the chunk text so results need no file access, and lines let later phases
+show or re-read the source. Payload indexes: `project_id` (tenant index: Qdrant stores each
+project's points together), `embedding_model`, `index_id`, `language`, `entity_type`. A
+collection whose dimension or distance does not match the model is refused
+(`VectorCollectionError`) instead of mixing vectors.
+
+**Chunk IDs** are `<entity_id>|<part>`, for example
+`<project_id>:app/auth/service.py:AuthService.login|1`. They depend on the project, file and
+qualified name (all already deterministic in Phase 4), not on line numbers: code moving down a
+file keeps its IDs. Point IDs are derived from them, so indexing again **overwrites** the same
+points (upsert) instead of adding duplicates.
+
+### Re-indexing
+
+Same approach as the Phase 6 graph: every point written by an indexing carries its random
+`index_id`. Once every chunk is embedded and written, the project's points with another
+`index_id` are deleted: code deleted or renamed since the last indexing. Nothing is deleted
+before the new points are written, so a failure half-way (model error, Qdrant down) never
+empties the index; search keeps working on old and new points until the next successful
+indexing. Unchanged chunks are embedded again (no content-hash cache yet).
+
+### Retrieval
+
+`VectorRetrievalService.retrieve(project_id, query, top_k=None, languages=None,
+entity_types=None)`: validate (project ID format, non-empty query of at most 2000 characters,
+`top_k` from 1 to `VECTOR_MAX_TOP_K` (50), default `VECTOR_TOP_K` (10), known languages and
+entity types), embed the query, search Qdrant, return `ChunkSearchResult(chunk, score)` best
+first (equal scores ordered by chunk ID). A project never indexed returns `[]`.
+
+**No similarity threshold by default.** Cosine scores depend on the model (bge models rarely
+score unrelated code below ~0.4, so "0.5" means different things for different models), and
+there is no labelled data yet to choose one. Ranking plus `top_k` bounds the results;
+`VECTOR_MIN_SCORE` can be set once measured, and is passed to Qdrant's `score_threshold`.
+
+### Project isolation
+
+Every search, count and delete goes through one filter builder that always starts with
+`project_id == <id>` and refuses an empty project ID, so no call can cover every project.
+Searches also filter on `embedding_model`. The project ID format is validated before anything
+is embedded. Tests index the same code in two projects and check that results, counts and
+deletions never cross.
+
+### Errors and security
+
+`QdrantVectorStore.qdrant_errors()` translates client exceptions: `VectorStoreUnavailableError`
+(503: unreachable, timeout, rejected API key), `VectorCollectionError` (500: missing or
+incompatible collection), `VectorStoreError` (500). The provider raises `EmbeddingModelError`
+(503) when the model cannot be loaded or fails. `InvalidVectorQueryError` (400) reports bad
+parameters. Messages never contain the API key (`SecretStr`) or source code; logs only name
+exception types. Filters are built with qdrant-client objects (`FieldCondition`,
+`MatchValue`...), never from text; collection names come from settings and must match
+`[A-Za-z0-9_-]{1,64}`. Repository code is only read as text: never imported or executed.
+
+### Testing
+
+Unit tests need no server and no model: the real `QdrantVectorStore` runs on qdrant-client's
+local in-memory mode (`QdrantClient(":memory:")`), and `HashingEmbeddings` (tests only) hashes
+words into a normalized vector so texts sharing words are close. Chunker tests use real Phase 3-4
+output in the four languages. Optional tests: `pytest -m qdrant` indexes and searches on a real
+server (temporary collection) and checks it answers exactly like the in-memory mode;
+`pytest -m embeddings` runs the real model, including the end-to-end check that "How does the
+application authenticate users?" finds the login code.
+
+Not in Phase 8, on purpose: API endpoints, hybrid retrieval with the graph, reranking, LLM.
+
+## GraphRAG retrieval (Phase 9)
+
+**Why:** each retrieval alone gives half an answer. Vector search (Phase 8) finds code *about*
+the question ("How is authentication implemented?" → `AuthService.login`) but knows nothing of
+connections: that `login` calls `UserRepository.find_user`, which queries `Database`. The graph
+(Phase 7) knows every connection, but only from an entity you name. GraphRAG uses vector hits as
+**starting points** and the graph to add **how they are connected**. It builds structured
+context only: no LLM, no prompt, no answer (Phase 10).
+
+```
+                    QUESTION
+                        │
+                        ▼
+      Vector retrieval (VectorRetrievalService)  ── Qdrant, filtered by project
+                        │  hits: chunk + score + entity_id + file + lines
+                        ▼
+           Seeds: distinct entity IDs, best score first (max 5)
+                        │
+                        ▼
+      Graph retrieval (GraphRetrievalService)    ── Neo4j, same project
+        per seed: a few one-hop questions chosen by its type,
+        then shortest paths between the top 3 seeds
+                        │
+                        ▼
+      GraphRAGContext: vector evidence + graph evidence + sources
+                        │
+                        ▼
+                  Phase 10 LLM (not yet)
+```
+
+`GraphRAGService` (`app/services/graphrag_service.py`) only orchestrates the two retrieval
+services: no Cypher, no Qdrant call, no second embedding. `app/graphrag/` holds the models and the
+expansion strategy; it depends on `graph/` and `rag/`, which still know nothing of each other.
+**The bridge is the Phase 4 entity ID:** a chunk's `entity_id` is the ID of a Neo4j node.
+
+### From vector hits to seeds
+
+The vector search returns `GRAPHRAG_VECTOR_TOP_K` (10) chunks. Several can belong to one entity
+(parts of a long method), so they are grouped by `entity_id`: one **seed** per entity, ranked by
+its best score, with all its chunk IDs. Only the first `GRAPHRAG_MAX_SEEDS` (5) are expanded; the
+other hits stay as vector evidence. Each seed is looked up in the graph first: a seed missing
+from the graph (the vector index and the graph built at different times) keeps its vector
+evidence and gets a warning, and is not expanded.
+
+### Graph expansion strategy
+
+Not every question for every seed ("vector search + dump the graph" buries the relevant code).
+Each type gets the one-hop questions that explain what it is and how it is used
+(`app/graphrag/expansion.py`), each limited to `GRAPHRAG_NEIGHBORS_PER_EXPANSION` (5) results:
+
+| Seed type | Expansions, in order |
+| --- | --- |
+| method, function | container (its class or file), callees, callers |
+| class | container, members, parents, subclasses, implemented interfaces, callers (who creates it) |
+| interface | container, members, parents, subclasses, implementations |
+| file | members, dependencies, dependents (DEPENDS_ON already covers imports) |
+
+Then the shortest path (depth ≤ `GRAPHRAG_PATH_MAX_DEPTH`, 3; one per pair, tried in both
+directions) between each pair of the first `GRAPHRAG_PATH_SEEDS` (3) seeds shows how the top
+results relate (`login → find_user → Database.query`). A one-relationship path already in the
+context is not repeated as a path. Every question is a Phase 7 operation with
+its own limits: expansions are one hop, paths are bounded; there is no other traversal.
+`GraphRetrievalService.get_container()` was added for the container question (the CONTAINS edge,
+read from Neo4j); nothing else in Phase 7 changed.
+
+### Deduplication and ordering
+
+- **Seeds:** one per entity, whatever the number of its chunks; each is expanded once.
+- **Entities:** seeds first (by rank), then neighbors in discovery order: seed rank, then the
+  strategy's order, then Phase 7's order. A neighbor reached from several seeds appears once,
+  with all those seed IDs. A neighbor that is itself a seed stays a seed.
+- **Relationships:** one per relationship ID, attributed to the first seed/expansion that found
+  it (`login CALLS create_token` is both login's callee and create_token's caller: kept once).
+- **Sources:** one per location (file, lines, entity).
+
+There is **no combined score**: vector hits keep the Phase 8 order (rounded score, then chunk ID),
+and graph evidence is attached to its seeds. Transparent and deterministic: the same question on
+the same project gives the same context.
+
+### The context
+
+`GraphRAGContext` (`app/graphrag/models.py`): `project_id`, `query`, `vector_results` (Phase 8
+`ChunkSearchResult`s: chunk text, score, entity, file, lines), `seeds` (entity, rank, best
+score, chunk IDs, expansions run), `entities` (`ContextEntity`: Phase 7 `EntityResult`, role
+seed/neighbor, the seeds that reached it, vector score if any), `relationships`
+(`ContextRelationship`: Phase 7 `RelationshipResult` with type, ends, file/line/column, plus the
+seed and expansion that found it), `paths`, `sources`, `graph_status`, `warnings`,
+`statistics`. `describe()` gives a readable outline (for logs and debugging, not a prompt).
+
+### Source traceability
+
+Every item carries its entity ID, file path and line range. `sources` lists what to cite: every
+vector chunk (its lines, score and chunk ID, reason `vector`), then every graph entity not already
+cited through a chunk (its full lines, reason `graph`). "Why is this here?" always has an answer:
+a vector score, or a relationship to a seed.
+
+### Limits
+
+| Setting | Default | Bounds |
+| --- | --- | --- |
+| `GRAPHRAG_VECTOR_TOP_K` | 10 | 1 – `VECTOR_MAX_TOP_K` (50) |
+| `GRAPHRAG_MAX_SEEDS` | 5 | 1 – 20 |
+| `GRAPHRAG_NEIGHBORS_PER_EXPANSION` | 5 | 1 – 200 |
+| `GRAPHRAG_MAX_CONTEXT_ENTITIES` | 40 | max seeds – 200 (seeds always kept; relationships and sources of dropped neighbors are dropped too) |
+| `GRAPHRAG_PATH_SEEDS` | 3 | 0 – 5 |
+| `GRAPHRAG_PATH_MAX_DEPTH` | 3 | 1 – 5 |
+
+At most 5 seeds × 6 expansions + 6 path queries: a few dozen bounded queries per question.
+
+### Project isolation
+
+The vector search validates the project ID and filters by project (Phase 8); hits of another
+project are dropped anyway (with a warning); every graph question uses the same project ID, whose
+prefix Phase 7 checks on every entity ID; graph neighbors and path nodes of another project are
+dropped. Tests hold two projects with the same code in both stores and check that no ID, query
+parameter or source crosses.
+
+### Failure behavior
+
+| Situation | Result |
+| --- | --- |
+| Invalid project ID, empty question | `ProjectNotFoundError` / `InvalidVectorQueryError`, before any query |
+| Qdrant or the embedding model fails | the error is raised (no seeds, nothing to build on); Neo4j is not queried |
+| A seed is not in the graph | kept as vector evidence, not expanded, warning; status stays `complete` |
+| A seed has no neighbors | no graph evidence for it; not an error |
+| Neo4j fails (`GraphDatabaseError`) | expansion stops; the context keeps the vector evidence and the graph evidence already collected, `graph_status` = `unavailable` (nothing collected) or `partial`, plus a warning. With `GRAPHRAG_REQUIRE_GRAPH=true`, the error is raised instead |
+
+Vector evidence alone is still useful context, and the status makes the degradation explicit
+instead of silent. Errors are `AppError`s; the service knows nothing about HTTP.
+
+### Security
+
+Nothing new is exposed: no Cypher or Qdrant filter is built here (only the typed operations of
+Phases 7 and 8, with their whitelists and parameters), no traversal beyond one hop and bounded
+paths, no code executed or sent anywhere, logs hold counts and error types only.
+
+### Testing
+
+`tests/test_graphrag.py` builds a small project (AuthService, UserRepository, Database, a
+subclass, an unrelated file) twice, in the fake Neo4j (real Phase 3-6 pipeline) and in the
+in-memory Qdrant (real chunker), for projects A and B. It checks seeds and deduplication, method,
+class and file expansions, paths, missing seeds, isolation, Neo4j down or failing midway, Qdrant
+down, every limit, determinism, source and relationship metadata, and that nothing but the two
+retrieval services is used. An end-to-end test imports the project as a ZIP, builds the graph
+and the vector index with the real services, and checks that "How is authentication
+implemented?" gives `AuthService.login` with its lines, `CALLS UserRepository.find_user` and
+`CALLS AuthService.create_token`. `pytest -m "neo4j and qdrant"` builds the same context on the
+real servers and requires it to equal the fakes'.
+
+Not in Phase 9, on purpose: API endpoints, LLM calls, prompts, reranking, query rewriting.
+
 ## Future packages
 
-New packages (`rag/`, `llm/`) are added only when the phase that needs them is reached. GraphRAG
-(Phase 9) will combine `GraphRetrievalService` with vector search (Phase 8).
+New packages (`llm/`...) are added only when the phase that needs them is reached. Phase 10 will
+turn a `GraphRAGContext` into a prompt and an answer with citations.

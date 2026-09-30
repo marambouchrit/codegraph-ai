@@ -7,12 +7,14 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 7 — graph retrieval. Projects can be imported from GitHub or a ZIP file,
+> **Status:** Phase 9 — GraphRAG retrieval. Projects can be imported from GitHub or a ZIP file,
 > their source files are parsed, the files, classes, interfaces, functions and methods they
 > define are extracted, the relationships between them (imports, inheritance, calls, type uses,
-> file dependencies) are resolved, the result is stored as a knowledge graph in Neo4j, and that
-> graph can be queried (callers, dependencies, inheritance, paths...); analysis features are
-> built incrementally (see [Roadmap](#roadmap)).
+> file dependencies) are resolved, the result is stored as a knowledge graph in Neo4j that can
+> be queried (callers, dependencies, inheritance, paths...), and the code is indexed in Qdrant
+> for semantic search with a local embedding model, and both are combined into structured
+> GraphRAG context (vector hits expanded through the graph); analysis features are built
+> incrementally (see [Roadmap](#roadmap)).
 
 ## Tech stack
 
@@ -21,7 +23,7 @@ project — with answers grounded in the code and linked to source locations.
 | Backend        | Python 3.11+, FastAPI, Pydantic              |
 | Code analysis  | Tree-sitter (official grammar packages)      |
 | Knowledge graph| Neo4j 5 (official Python driver)             |
-| Vector search  | Qdrant + open-source embeddings *(Phase 8)*  |
+| Vector search  | Qdrant + local open-source embeddings (sentence-transformers) |
 | LLM            | Provider-agnostic `LLMProvider` *(Phase 10)* |
 | Frontend       | React, TypeScript, Vite                      |
 
@@ -36,7 +38,7 @@ codegraph-ai/
 │   └── tests/        # pytest tests
 ├── frontend/         # React + TypeScript + Vite application
 ├── docs/             # documentation
-└── docker-compose.yml  # local Neo4j
+└── docker-compose.yml  # local Neo4j and Qdrant
 ```
 
 ## Getting started
@@ -46,7 +48,7 @@ codegraph-ai/
 - Python 3.11 or newer
 - Git (used to clone GitHub repositories)
 - Node.js 20.19+ (or 22.12+) and npm
-- Docker (only to run Neo4j for the knowledge graph)
+- Docker (only to run Neo4j and Qdrant locally)
 
 ### Backend
 
@@ -76,6 +78,8 @@ cd backend
 pytest               # fast tests: no internet, no Neo4j needed
 pytest -m network    # clones a real repository from GitHub
 pytest -m neo4j      # needs a running Neo4j (see "Knowledge graph" below)
+pytest -m qdrant     # needs a running Qdrant (see "Semantic code search" below)
+pytest -m embeddings # runs the real embedding model (downloaded on first use)
 ```
 
 ### Importing a project (API)
@@ -263,6 +267,130 @@ needed). `pytest -m neo4j` (Neo4j started, `NEO4J_PASSWORD` in `backend/.env` ma
 Docker Compose password) also asks every retrieval question to the real server and to the fake,
 and requires identical answers.
 
+### Semantic code search (Qdrant)
+
+The knowledge graph answers *how code is connected*; semantic search answers *where something
+is done*, even when the question names no class or function ("How is authentication
+implemented?"). Source files are cut into **code-aware chunks** (one per function or method, a
+skeleton per class, module-level code per file), each chunk is turned into a vector by a
+**local embedding model**, and the vectors are stored in [Qdrant](https://qdrant.tech/), a vector
+database. A question is embedded with the same model, and Qdrant returns the closest chunks of
+that project.
+
+```
+source files ─> ParserService ─> entities ─> CodeChunker ─> EmbeddingProvider ─> Qdrant
+                                                                                   ▲
+question ─────────────────────────────────────> EmbeddingProvider ─> search (project filter)
+```
+
+**1. Start Qdrant** (from the repository root; data is kept in the `qdrant-data` Docker volume):
+
+```bash
+docker compose up -d qdrant     # REST API on http://127.0.0.1:6333 (dashboard: /dashboard)
+docker compose stop qdrant      # stop it, data kept; `docker compose down -v` deletes the data
+```
+
+**2. The embedding model** (`EMBEDDING_MODEL`, default `BAAI/bge-small-en-v1.5`: 384 dimensions,
+~130 MB) runs on your machine with sentence-transformers. It is downloaded once from Hugging Face
+into the local cache on first use; no code is ever sent to an external service and no API key is
+needed. `BAAI/bge-m3` (1024 dimensions, ~2.3 GB, slower on a CPU) also works: set it together
+with another `QDRANT_COLLECTION`, since a collection holds vectors of one dimension.
+
+**3. Index a project and search it** (no API endpoint yet; from `backend/`):
+
+```python
+from app.core.config import get_settings
+from app.rag.embeddings import get_embedding_provider
+from app.rag.vector_store import QdrantVectorStore
+from app.services.vector_index_service import VectorIndexService
+from app.services.vector_retrieval_service import VectorRetrievalService
+
+settings = get_settings()
+embeddings = get_embedding_provider(settings.embedding_model)   # loaded once, reused
+with QdrantVectorStore.from_settings(settings) as store:
+    report = VectorIndexService(settings, store, embeddings).index_project("<project_id>")
+    print(report.summary)   # Vector index built successfully: 73 files, 640 chunks (...)
+
+    retrieval = VectorRetrievalService(store, embeddings, settings)
+    for hit in retrieval.retrieve("<project_id>", "How are users authenticated?", top_k=5):
+        chunk = hit.chunk
+        print(f"{hit.score:.2f} {chunk.qualified_name} {chunk.file_path}:{chunk.start_line}")
+```
+
+Indexing again is safe: chunks keep the same IDs (no duplicates) and code deleted since the last
+indexing is removed. Results are limited (`top_k`, default 10, at most 50), always filtered by
+project, and can be filtered by language or entity type (`languages=["python"]`,
+`entity_types=["method"]`). See [docs/architecture.md](docs/architecture.md#vector-rag-phase-8).
+
+**Tests:** `pytest` covers chunking, indexing and search with an in-memory Qdrant and a tiny test
+embedding (no server, no download). `pytest -m qdrant` (Qdrant started) runs them against the
+real server; `pytest -m embeddings` runs the real model, including an end-to-end semantic search.
+
+### GraphRAG retrieval
+
+Semantic search finds code *about* a question; the knowledge graph knows *how that code is
+connected*. GraphRAG uses both: the vector hits become **starting points** (their `entity_id` is
+also a Neo4j node ID), and the graph adds each one's class or file, what it calls, who calls it,
+its members, subclasses, dependencies... and how the top results connect to each other.
+
+```
+question ─> vector search (Qdrant) ─> hits ─> distinct entities (seeds)
+        ─> graph questions per seed type (Neo4j, one hop, bounded) ─> GraphRAGContext
+```
+
+The result is **structured context, not an answer** (no LLM yet): the vector hits with their
+scores, the seeds, the graph entities and relationships, shortest paths between seeds, and the
+**sources** to cite (file + line range + why each one is there). With both databases running and
+the project analyzed and indexed (see above), from `backend/`:
+
+```python
+from app.core.config import get_settings
+from app.graph.client import Neo4jClient
+from app.graph.repository import GraphRepository
+from app.rag.embeddings import get_embedding_provider
+from app.rag.vector_store import QdrantVectorStore
+from app.services.graph_retrieval_service import GraphRetrievalService
+from app.services.graphrag_service import GraphRAGService
+from app.services.vector_retrieval_service import VectorRetrievalService
+
+settings = get_settings()
+embeddings = get_embedding_provider(settings.embedding_model)
+with Neo4jClient.from_settings(settings) as client, QdrantVectorStore.from_settings(settings) as store:
+    graphrag = GraphRAGService(
+        VectorRetrievalService(store, embeddings, settings),
+        GraphRetrievalService(GraphRepository(client)),
+        settings,
+    )
+    context = graphrag.build_context("<project_id>", "How is authentication implemented?")
+    print("\n".join(context.describe()))
+```
+
+Example outline (abridged; scores depend on the model):
+
+```
+Question: How is authentication implemented?
+Vector evidence:
+  0.712  AuthService.login  auth/service.py:14-20
+  ...
+Graph evidence (complete):
+  AuthService CONTAINS AuthService.login
+  AuthService.login CALLS UserRepository.find_user
+  AuthService.login CALLS AuthService.create_token
+  path: AuthService.login -> UserRepository.find_user -> Database.query
+Sources:
+  auth/service.py:14-20  AuthService.login (vector)
+  repository/user.py:7-9  UserRepository.find_user (graph)
+```
+
+Everything is bounded (5 seeds, 5 neighbors per graph question, 40 entities, paths between the
+top 3 seeds, at most 3 relationships long), deterministic, and scoped to one project. If Neo4j is
+down, the context keeps the vector evidence with `graph_status="unavailable"` and a warning (or
+fails, with `GRAPHRAG_REQUIRE_GRAPH=true`). See
+[docs/architecture.md](docs/architecture.md#graphrag-retrieval-phase-9).
+
+**Tests:** `pytest` covers GraphRAG with the fake Neo4j and the in-memory Qdrant;
+`pytest -m "neo4j and qdrant"` (both started) checks the real servers give the same context.
+
 ### Frontend
 
 ```bash
@@ -299,6 +427,22 @@ Git; each app has a committed `.env.example` template.
 |                         | `NEO4J_PASSWORD` | *(empty)*               | Neo4j password (never logged)     |
 |                         | `NEO4J_DATABASE` | `neo4j`                 | Neo4j database name               |
 |                         | `GRAPH_BATCH_SIZE` | `1000`                | Nodes / relationships per write query |
+|                         | `QDRANT_URL`    | `http://127.0.0.1:6333`  | Qdrant server (REST API); not `localhost`, slow on Windows |
+|                         | `QDRANT_API_KEY` | *(empty)*               | Qdrant API key, for a secured server (never logged) |
+|                         | `QDRANT_COLLECTION` | `codegraph_chunks`   | Collection holding every project's chunks |
+|                         | `QDRANT_TIMEOUT_SECONDS` | `10`            | Qdrant request timeout            |
+|                         | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local sentence-transformers model |
+|                         | `EMBEDDING_BATCH_SIZE` | `32`              | Chunks embedded and written together |
+|                         | `VECTOR_CHUNK_MAX_CHARS` | `2000`          | Longer chunks are split on line boundaries |
+|                         | `VECTOR_CHUNK_OVERLAP_LINES` | `3`         | Lines repeated between split parts |
+|                         | `VECTOR_TOP_K` / `VECTOR_MAX_TOP_K` | `10` / `50` | Default and maximum results per search |
+|                         | `VECTOR_MIN_SCORE` | *(unset)*             | Optional minimum cosine similarity |
+|                         | `GRAPHRAG_VECTOR_TOP_K` | `10`             | Vector hits per GraphRAG question |
+|                         | `GRAPHRAG_MAX_SEEDS` | `5`                 | Distinct hit entities expanded in the graph |
+|                         | `GRAPHRAG_NEIGHBORS_PER_EXPANSION` | `5`   | Results per graph question (callers...) |
+|                         | `GRAPHRAG_MAX_CONTEXT_ENTITIES` | `40`     | Seeds + neighbors in the context |
+|                         | `GRAPHRAG_PATH_SEEDS` / `GRAPHRAG_PATH_MAX_DEPTH` | `3` / `3` | Paths between the top seeds |
+|                         | `GRAPHRAG_REQUIRE_GRAPH` | `false`         | Fail (instead of vector-only context) when Neo4j fails |
 | `.env` (root, optional) | `NEO4J_PASSWORD` | `change-me-please`      | Password of the Docker Compose Neo4j |
 | `frontend/.env`         | `VITE_API_URL`  | `http://localhost:8000`  | Backend base URL                  |
 
@@ -333,6 +477,13 @@ Imported code is treated as untrusted input:
   scoped by `project_id` (an entity ID of another project is rejected before reaching Neo4j),
   traversal depths are checked integers from 1 to 5 (never an unbounded `*`), and every result
   list has a limit.
+- **Semantic search** runs the embedding model locally (`trust_remote_code=False`): repository
+  code never leaves the machine. Every Qdrant search, count and delete is filtered by
+  `project_id` through qdrant-client filter objects (never text), searches are bounded
+  (`top_k` ≤ 50), the collection name is validated, and the Qdrant API key is a `SecretStr`.
+- **GraphRAG** only combines the typed operations above (no Cypher or Qdrant filter of its own),
+  keeps every result in the requested project, expands one hop per seed with bounded paths, and
+  never calls an external service.
 
 ## Roadmap
 
@@ -343,8 +494,8 @@ Imported code is treated as untrusted input:
 5. ✅ Relationship extraction (imports, inheritance, calls, uses, dependencies)
 6. ✅ Knowledge graph (Neo4j)
 7. ✅ Graph retrieval
-8. Vector RAG (chunking, embeddings, Qdrant)
-9. GraphRAG (hybrid retrieval + context fusion)
+8. ✅ Vector RAG (chunking, embeddings, Qdrant)
+9. ✅ GraphRAG (hybrid retrieval + context fusion)
 10. LLM assistant (`POST /projects/{id}/chat`)
 11. Frontend (import, dashboard, explorer, chat)
 12. Graph visualization

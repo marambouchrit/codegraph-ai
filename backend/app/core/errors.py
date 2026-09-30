@@ -81,3 +81,33 @@ class GraphDatabaseConfigError(GraphDatabaseError):
     """Neo4j is reachable but the configuration is wrong (credentials, URI, database name)."""
 
     status_code = 503
+
+
+class VectorStoreError(AppError):
+    """A Qdrant operation failed."""
+
+    status_code = 500
+
+
+class VectorStoreUnavailableError(VectorStoreError):
+    """Qdrant cannot be reached, or it rejected the API key."""
+
+    status_code = 503
+
+
+class VectorCollectionError(VectorStoreError):
+    """The Qdrant collection is invalid or does not fit the embedding model (dimension...)."""
+
+    status_code = 500
+
+
+class EmbeddingModelError(AppError):
+    """The local embedding model could not be loaded or could not embed a text."""
+
+    status_code = 503
+
+
+class InvalidVectorQueryError(AppError):
+    """A vector search request with invalid parameters (empty query, top_k, filters...)."""
+
+    status_code = 400

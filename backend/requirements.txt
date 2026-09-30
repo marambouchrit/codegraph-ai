@@ -12,3 +12,8 @@ tree-sitter-javascript>=0.25,<0.26
 tree-sitter-typescript>=0.23.2,<0.24
 # Knowledge graph (Phase 6): the official Neo4j driver (works with Neo4j 5.x and 2025.x).
 neo4j>=6.0,<7.0
+# Vector search (Phase 8): the Qdrant client, and local embedding models (installs PyTorch).
+# On Linux, the default PyTorch wheel includes CUDA (~2.5 GB); for a CPU-only machine, first run:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+qdrant-client>=1.15,<2.0
+sentence-transformers>=5.0,<7.0

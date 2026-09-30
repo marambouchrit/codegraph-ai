@@ -37,6 +37,28 @@ class Settings(BaseSettings):
     # Number of nodes or relationships sent to Neo4j in one query (see app/graph/repository.py).
     graph_batch_size: int = 1000
 
+    # --- Vector search (Qdrant + local embeddings) ---
+    # 127.0.0.1 rather than localhost: on Windows, "localhost" is tried over IPv6 first,
+    # which costs ~2 s per connection to a server listening on IPv4 only (Docker here).
+    qdrant_url: str = "http://127.0.0.1:6333"
+    # Empty for the local Docker Qdrant (no authentication); set it for a secured server.
+    qdrant_api_key: SecretStr = SecretStr("")
+    # One collection for all projects: every point carries its project_id (see app/rag/).
+    qdrant_collection: str = "codegraph_chunks"
+    qdrant_timeout_seconds: int = 10
+    # Any sentence-transformers model from Hugging Face, run locally (no API key, no cloud).
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Chunks embedded (and sent to Qdrant) together.
+    embedding_batch_size: int = 32
+    # Chunks longer than this are split on line boundaries (about 4 characters per token).
+    vector_chunk_max_chars: int = 2000
+    # Lines repeated at the start of the next part when a chunk is split.
+    vector_chunk_overlap_lines: int = 3
+    vector_top_k: int = 10
+    vector_max_top_k: int = 50
+    # Results scoring below this are dropped. None: no threshold (see docs/architecture.md).
+    vector_min_score: float | None = None
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

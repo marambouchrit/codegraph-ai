@@ -16,7 +16,6 @@ import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, Self, TypeVar
-from urllib.parse import urlsplit
 
 import neo4j
 from neo4j import exceptions as neo4j_exceptions
@@ -27,6 +26,7 @@ from app.core.errors import (
     GraphDatabaseError,
     GraphDatabaseUnavailableError,
 )
+from app.core.urls import safe_uri
 
 logger = logging.getLogger(__name__)
 
@@ -153,14 +153,3 @@ class Neo4jClient:
             logger.error("Neo4j driver error: %s", type(error).__name__)
             raise GraphDatabaseError("A Neo4j transaction failed.") from error
 
-
-def safe_uri(uri: str) -> str:
-    """The URI without any "user:password@" part, safe to log or show."""
-    try:
-        parts = urlsplit(uri)
-        host, port = parts.hostname or "", parts.port
-    except ValueError:  # e.g. a port that is not a number
-        return "<invalid URI>"
-    if not parts.scheme:
-        return "<invalid URI>"
-    return f"{parts.scheme}://{host}:{port}" if port else f"{parts.scheme}://{host}"

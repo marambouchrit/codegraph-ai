@@ -1,12 +1,14 @@
 # Local development services for CodeGraph AI.
 #
-#   docker compose up -d neo4j      start Neo4j in the background
-#   docker compose ps               check that it is running ("healthy")
-#   docker compose stop neo4j       stop it (data is kept)
-#   docker compose down -v          remove it, including its data
+#   docker compose up -d neo4j qdrant   start Neo4j and Qdrant in the background
+#   docker compose ps                   check that they are running ("healthy")
+#   docker compose stop                 stop them (data is kept)
+#   docker compose down -v              remove them, including their data
 #
 # The backend reads NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD from backend/.env:
 # use the same password as NEO4J_PASSWORD below (or in a root .env file).
+# Qdrant runs without authentication here (it is only reachable from this machine);
+# the backend's QDRANT_URL defaults to http://127.0.0.1:6333.
 
 services:
   neo4j:
@@ -32,5 +34,23 @@ services:
       retries: 12
     restart: unless-stopped
 
+  qdrant:
+    # Vector database for semantic code search (Phase 8).
+    image: qdrant/qdrant:v1.19.1
+    container_name: codegraph-qdrant
+    ports:
+      - "127.0.0.1:6333:6333"  # REST API, used by the backend (dashboard: /dashboard)
+      - "127.0.0.1:6334:6334"  # gRPC API (not used by the backend)
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      # The image has no curl or wget: open a TCP connection with bash instead.
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
 volumes:
   neo4j-data:
+  qdrant-data:

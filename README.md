@@ -79,7 +79,7 @@ pytest               # fast tests: no internet, no Neo4j needed
 pytest -m network    # clones a real repository from GitHub
 pytest -m neo4j      # needs a running Neo4j (see "Knowledge graph" below)
 pytest -m qdrant     # needs a running Qdrant (see "Semantic code search" below)
-pytest -m embeddings # runs the real embedding model (downloaded on first use)
+pytest -m embeddings # runs the real embedding model (BGE-M3, ~2.3 GB downloaded on first use)
 ```
 
 ### Importing a project (API)
@@ -290,23 +290,32 @@ docker compose up -d qdrant     # REST API on http://127.0.0.1:6333 (dashboard: 
 docker compose stop qdrant      # stop it, data kept; `docker compose down -v` deletes the data
 ```
 
-**2. The embedding model** (`EMBEDDING_MODEL`, default `BAAI/bge-small-en-v1.5`: 384 dimensions,
-~130 MB) runs on your machine with sentence-transformers. It is downloaded once from Hugging Face
-into the local cache on first use; no code is ever sent to an external service and no API key is
-needed. `BAAI/bge-m3` (1024 dimensions, ~2.3 GB, slower on a CPU) also works: set it together
-with another `QDRANT_COLLECTION`, since a collection holds vectors of one dimension.
+**2. The embedding model** (`EMBEDDING_MODEL`, default `BAAI/bge-m3`: dense vectors of **1024
+dimensions**) runs on your machine with sentence-transformers, on the CPU by default
+(`EMBEDDING_DEVICE=cpu`; `cuda` or `mps` for a GPU, never required). It is downloaded once from
+Hugging Face into the standard Hugging Face cache (about 2.3 GB; `HF_HOME` moves it) the first
+time it is used, then loaded from there, once per process. No code is ever sent to an external
+service and no API key is needed. To download it ahead of time (from `backend/`):
+
+```bash
+python -c "from app.core.config import Settings; from app.rag.embeddings import embedding_provider_from_settings as p; print(p(Settings()).dimension)"   # prints 1024
+```
+
+If the download stalls on Windows, set `HF_HUB_DISABLE_XET=1` and run it again: it resumes.
+`BAAI/bge-small-en-v1.5` (384 dimensions, ~130 MB) is a much faster alternative on a CPU; see
+[Changing the embedding model](#changing-the-embedding-model) below.
 
 **3. Index a project and search it** (no API endpoint yet; from `backend/`):
 
 ```python
 from app.core.config import get_settings
-from app.rag.embeddings import get_embedding_provider
+from app.rag.embeddings import embedding_provider_from_settings
 from app.rag.vector_store import QdrantVectorStore
 from app.services.vector_index_service import VectorIndexService
 from app.services.vector_retrieval_service import VectorRetrievalService
 
 settings = get_settings()
-embeddings = get_embedding_provider(settings.embedding_model)   # loaded once, reused
+embeddings = embedding_provider_from_settings(settings)   # loaded once, reused
 with QdrantVectorStore.from_settings(settings) as store:
     report = VectorIndexService(settings, store, embeddings).index_project("<project_id>")
     print(report.summary)   # Vector index built successfully: 73 files, 640 chunks (...)
@@ -322,9 +331,44 @@ indexing is removed. Results are limited (`top_k`, default 10, at most 50), alwa
 project, and can be filtered by language or entity type (`languages=["python"]`,
 `entity_types=["method"]`). See [docs/architecture.md](docs/architecture.md#vector-rag-phase-8).
 
+#### Changing the embedding model
+
+Vectors of two models cannot be compared, and a Qdrant collection holds vectors of one
+dimension. Changing `EMBEDDING_MODEL` therefore does not update anything already indexed:
+
+1. Set `EMBEDDING_MODEL` **and a new `QDRANT_COLLECTION`** in `backend/.env` (the default
+   collection, `codegraph_chunks_bge_m3`, is for BGE-M3). The old collection is left untouched.
+2. Re-index every imported project (the Neo4j graph does not need rebuilding):
+
+   ```python
+   from app.core.config import get_settings
+   from app.rag.embeddings import embedding_provider_from_settings
+   from app.rag.vector_store import QdrantVectorStore
+   from app.services.vector_index_service import VectorIndexService
+
+   settings = get_settings()
+   with QdrantVectorStore.from_settings(settings) as store:
+       service = VectorIndexService(settings, store, embedding_provider_from_settings(settings))
+       reports, failures = service.index_all_projects()   # one failure never stops the others
+       for report in reports:
+           print(report.project_id, report.summary)
+       print("failed:", failures)
+   ```
+
+3. Once search works, delete the old collection if you no longer need it (Qdrant dashboard at
+   <http://127.0.0.1:6333/dashboard>, or `curl -X DELETE http://127.0.0.1:6333/collections/<old name>`).
+
+Searching a collection built with a model of another dimension fails with a clear
+`VectorCollectionError` (never a mixed result). Within one collection, points record their model
+and searches only compare vectors of the same model, so an interrupted re-indexing never breaks
+search with the previous model.
+
 **Tests:** `pytest` covers chunking, indexing and search with an in-memory Qdrant and a tiny test
 embedding (no server, no download). `pytest -m qdrant` (Qdrant started) runs them against the
-real server; `pytest -m embeddings` runs the real model, including an end-to-end semantic search.
+real server; `pytest -m embeddings` runs the real model (dimension, finite normalized vectors,
+batches, an end-to-end semantic search). `pytest -m "neo4j and qdrant and embeddings"` runs
+GraphRAG with the real model on both servers. On a CPU, BGE-M3 indexes about 3–4 s per chunk
+(roughly an hour for a repository of 1,000 chunks); searching takes about 0.1 s.
 
 ### GraphRAG retrieval
 
@@ -347,14 +391,14 @@ the project analyzed and indexed (see above), from `backend/`:
 from app.core.config import get_settings
 from app.graph.client import Neo4jClient
 from app.graph.repository import GraphRepository
-from app.rag.embeddings import get_embedding_provider
+from app.rag.embeddings import embedding_provider_from_settings
 from app.rag.vector_store import QdrantVectorStore
 from app.services.graph_retrieval_service import GraphRetrievalService
 from app.services.graphrag_service import GraphRAGService
 from app.services.vector_retrieval_service import VectorRetrievalService
 
 settings = get_settings()
-embeddings = get_embedding_provider(settings.embedding_model)
+embeddings = embedding_provider_from_settings(settings)
 with Neo4jClient.from_settings(settings) as client, QdrantVectorStore.from_settings(settings) as store:
     graphrag = GraphRAGService(
         VectorRetrievalService(store, embeddings, settings),
@@ -429,9 +473,10 @@ Git; each app has a committed `.env.example` template.
 |                         | `GRAPH_BATCH_SIZE` | `1000`                | Nodes / relationships per write query |
 |                         | `QDRANT_URL`    | `http://127.0.0.1:6333`  | Qdrant server (REST API); not `localhost`, slow on Windows |
 |                         | `QDRANT_API_KEY` | *(empty)*               | Qdrant API key, for a secured server (never logged) |
-|                         | `QDRANT_COLLECTION` | `codegraph_chunks`   | Collection holding every project's chunks |
+|                         | `QDRANT_COLLECTION` | `codegraph_chunks_bge_m3` | Collection holding every project's chunks (one per model) |
 |                         | `QDRANT_TIMEOUT_SECONDS` | `10`            | Qdrant request timeout            |
-|                         | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local sentence-transformers model |
+|                         | `EMBEDDING_MODEL` | `BAAI/bge-m3`         | Local sentence-transformers model (1024 dimensions) |
+|                         | `EMBEDDING_DEVICE` | `cpu`                | `cpu`, or `cuda` / `mps` for a GPU |
 |                         | `EMBEDDING_BATCH_SIZE` | `32`              | Chunks embedded and written together |
 |                         | `VECTOR_CHUNK_MAX_CHARS` | `2000`          | Longer chunks are split on line boundaries |
 |                         | `VECTOR_CHUNK_OVERLAP_LINES` | `3`         | Lines repeated between split parts |

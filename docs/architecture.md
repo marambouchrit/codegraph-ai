@@ -607,7 +607,7 @@ functions in half and glue unrelated code together):
 Every line of code is in exactly one chunk body; only signatures are repeated as context. An
 entity already shown whole by its parent (a one-line method, `interface Listener { void
 changed(); }`) gets no chunk of its own. A chunk longer than `VECTOR_CHUNK_MAX_CHARS` (2000,
-about 500 tokens: the input limit of bge-small) is split on line boundaries into parts that
+about 500 tokens; BGE-M3 accepts 8192, but one chunk per function keeps results precise) is split on line boundaries into parts that
 repeat `VECTOR_CHUNK_OVERLAP_LINES` (3) lines; a longer single line (minified code) is cut.
 Files with syntax errors are chunked like the others (Phase 4 still extracts their well-formed
 definitions); unreadable files are counted in the report. What is embedded is the chunk text
@@ -618,28 +618,37 @@ app/auth/service.py`): paths and entity kinds carry meaning the code alone may n
 
 `EmbeddingProvider` (`model_name`, `dimension`, `embed_documents`, `embed_query`) hides the
 model; `SentenceTransformerEmbeddings` runs any sentence-transformers model locally. The model
-is loaded on first use, once per process (`get_embedding_provider()`, thread-safe), with
+is loaded on first use, once per process (`embedding_provider_from_settings()`, cached and
+thread-safe), on `EMBEDDING_DEVICE` (default `cpu`; `cuda`/`mps` optional), with
 `trust_remote_code=False`. No code leaves the machine and no API key is needed.
 
-Default: **`BAAI/bge-small-en-v1.5`** (384 dimensions, ~130 MB, 512 input tokens). `BAAI/bge-m3`
-(1024 dimensions, ~2.3 GB, 8192 tokens, multilingual) was the first candidate; on a laptop CPU it
-indexes about 15× slower for little gain on function-sized English/code chunks, so it is one
-setting away (`EMBEDDING_MODEL=BAAI/bge-m3`, with another `QDRANT_COLLECTION`) rather than the
-default. Documents and queries use the **same model** (vectors of two models live in unrelated
-spaces); bge v1.5 models expect a short instruction before queries only, which the provider adds.
-The dimension is never hard-coded: the collection is created from `EmbeddingProvider.dimension`.
+Default: **`BAAI/bge-m3`**, its **dense** output only (no sparse or multi-vector retrieval):
+1024 dimensions, 8192 input tokens, multilingual. It is downloaded once into the standard
+Hugging Face cache (`HF_HOME`): 2.3 GB of weights (`pytorch_model.bin`); on first load,
+`transformers` also fetches a `safetensors` copy of the weights in the background, so plan for
+about 4.5 GB of disk. Measured on a 12-thread laptop CPU: load 19–30 s from the cache, about
+2 GB of RAM once embedding, a query in about 0.1 s, and an indexing speed given in
+[Changing the embedding model](#changing-the-embedding-model). `BAAI/bge-small-en-v1.5` (384
+dimensions, ~130 MB) is much faster on a CPU and remains one setting away.
+
+Documents and queries use the **same model** (vectors of two models live in unrelated spaces).
+BGE-M3 needs no query instruction; bge v1.5 models expect one before queries only, which the
+provider adds. Every vector is checked: the model's dimension, and finite values only (a NaN
+would silently break every score). The dimension is never configured: it is read from the model
+(`EmbeddingProvider.dimension`), and the collection is created from it.
 
 **Distance:** cosine. Vectors are normalized, the similarity the bge models are trained for;
 scores range from -1 to 1, higher is closer.
 
 ### Qdrant
 
-One collection (`QDRANT_COLLECTION`, default `codegraph_chunks`) for every project, Qdrant's
-recommended layout for many tenants. Each point:
+One collection (`QDRANT_COLLECTION`, default `codegraph_chunks_bge_m3`) for every project,
+Qdrant's recommended layout for many tenants, and one collection per embedding model. Each
+point:
 
 | Part | Content |
 | --- | --- |
-| ID | `uuid5(chunk ID)`: Qdrant IDs must be UUIDs or integers |
+| ID | `uuid5(embedding model + chunk ID)`: Qdrant IDs must be UUIDs or integers |
 | Vector | the chunk's embedding |
 | Payload | `chunk_id`, `project_id`, `file_path`, `language`, `entity_id`, `entity_type`, `name`, `qualified_name`, `start_line`, `end_line`, `text`, `part`, `part_count`, `embedding_model`, `index_id` |
 
@@ -647,13 +656,15 @@ The payload keeps the chunk text so results need no file access, and lines let l
 show or re-read the source. Payload indexes: `project_id` (tenant index: Qdrant stores each
 project's points together), `embedding_model`, `index_id`, `language`, `entity_type`. A
 collection whose dimension or distance does not match the model is refused
-(`VectorCollectionError`) instead of mixing vectors.
+(`VectorCollectionError`) instead of mixing vectors, when indexing and when searching (a query
+vector of another dimension gets that clear error, not Qdrant's HTTP 400).
 
 **Chunk IDs** are `<entity_id>|<part>`, for example
 `<project_id>:app/auth/service.py:AuthService.login|1`. They depend on the project, file and
 qualified name (all already deterministic in Phase 4), not on line numbers: code moving down a
-file keeps its IDs. Point IDs are derived from them, so indexing again **overwrites** the same
-points (upsert) instead of adding duplicates.
+file keeps its IDs. Point IDs are derived from them and from the model, so indexing again with
+the same model **overwrites** the same points (upsert) instead of adding duplicates, and indexing
+with another model never overwrites the previous model's points.
 
 ### Re-indexing
 
@@ -664,6 +675,30 @@ before the new points are written, so a failure half-way (model error, Qdrant do
 empties the index; search keeps working on old and new points until the next successful
 indexing. Unchanged chunks are embedded again (no content-hash cache yet).
 
+### Changing the embedding model
+
+Changing `EMBEDDING_MODEL` does not change any stored vector. The safe procedure:
+
+1. Set the new `EMBEDDING_MODEL` and a **new `QDRANT_COLLECTION`**. The old collection is never
+   touched, so nothing is deleted before the new index exists.
+2. Re-index the projects: `VectorIndexService.index_all_projects()` indexes every imported
+   project, reports each failure without stopping the others, and stops at once if the model,
+   Qdrant or the collection is unusable (it would fail the same way for every project).
+3. Delete the old collection by hand once the new one works.
+
+The knowledge graph does not change: chunk entity IDs are the Neo4j node IDs whatever the model.
+If the collection is kept instead (same dimension), it stays safe: searches filter on
+`embedding_model`, a new-model indexing writes new points next to the old ones, and the old
+model's points are removed only after it succeeds, as stale points.
+
+**CPU cost, measured** (12-thread laptop CPU, no GPU): migrating the Flask repository (83 files,
+1,055 chunks) from bge-small to BGE-M3 wrote **352 chunks in about 21 minutes** (about 3.6 s per
+chunk, so roughly an hour for the whole repository) before the run was stopped on purpose; the
+old 384-dimension collection kept its 1,055 points untouched. bge-small indexes the same project
+in under 5 minutes. Search stays fast (about 0.1 s per question). **Limitation:** the Flask
+benchmark with BGE-M3 is incomplete, and indexing large repositories with BGE-M3 on a CPU is
+slow; `EMBEDDING_DEVICE=cuda` (a GPU) or bge-small are the options when that matters.
+
 ### Retrieval
 
 `VectorRetrievalService.retrieve(project_id, query, top_k=None, languages=None,
@@ -672,10 +707,14 @@ entity_types=None)`: validate (project ID format, non-empty query of at most 200
 entity types), embed the query, search Qdrant, return `ChunkSearchResult(chunk, score)` best
 first (equal scores ordered by chunk ID). A project never indexed returns `[]`.
 
-**No similarity threshold by default.** Cosine scores depend on the model (bge models rarely
-score unrelated code below ~0.4, so "0.5" means different things for different models), and
-there is no labelled data yet to choose one. Ranking plus `top_k` bounds the results;
-`VECTOR_MIN_SCORE` can be set once measured, and is passed to Qdrant's `score_threshold`.
+**No similarity threshold by default.** Cosine scores depend on the model, so "0.5" means
+different things for different models. Measured with BGE-M3 on the test project (15 chunks):
+the relevant hits of four real questions scored **0.52–0.68**, and the best hits of two
+unrelated questions ("How is the weather forecast downloaded?") **0.38–0.45**. A threshold
+around 0.5 would separate them there, but 6 questions on 15 chunks are not enough evidence to
+choose one for every repository, so none is set: ranking plus `top_k` bounds the results, and
+an unrelated question still gets low-scoring context. `VECTOR_MIN_SCORE` can be set once
+measured on labelled questions; it is passed to Qdrant's `score_threshold`.
 
 ### Project isolation
 
@@ -703,8 +742,13 @@ local in-memory mode (`QdrantClient(":memory:")`), and `HashingEmbeddings` (test
 words into a normalized vector so texts sharing words are close. Chunker tests use real Phase 3-4
 output in the four languages. Optional tests: `pytest -m qdrant` indexes and searches on a real
 server (temporary collection) and checks it answers exactly like the in-memory mode;
-`pytest -m embeddings` runs the real model, including the end-to-end check that "How does the
-application authenticate users?" finds the login code.
+`pytest -m embeddings` runs the real model (1024 dimensions for BGE-M3, finite normalized
+vectors, batches equal to single embeddings), including the end-to-end check that "How does the
+application authenticate users?" finds the login code; with Neo4j and Qdrant started,
+`pytest -m "neo4j and qdrant and embeddings"` also runs GraphRAG with the real model. Unit tests
+cover the model change itself: another model's vectors are never searched, a re-indexing with a
+new model replaces the old points only once it succeeds, a failed one keeps the old index
+searchable, and a query vector of the wrong dimension gets a clear error.
 
 Not in Phase 8, on purpose: API endpoints, hybrid retrieval with the graph, reranking, LLM.
 

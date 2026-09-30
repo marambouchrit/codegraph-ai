@@ -111,3 +111,27 @@ class InvalidVectorQueryError(AppError):
     """A vector search request with invalid parameters (empty query, top_k, filters...)."""
 
     status_code = 400
+
+
+class LLMError(AppError):
+    """The LLM could not produce an answer."""
+
+    status_code = 502
+
+
+class LLMConfigurationError(LLMError):
+    """The LLM settings are wrong: unknown provider, missing or rejected API key, bad model."""
+
+    status_code = 503
+
+
+class LLMUnavailableError(LLMError):
+    """The LLM provider cannot be reached, timed out, is overloaded or rate limited."""
+
+    status_code = 503
+
+
+class LLMResponseError(LLMError):
+    """The provider answered, but with no usable answer (empty, malformed, declined)."""
+
+    status_code = 502

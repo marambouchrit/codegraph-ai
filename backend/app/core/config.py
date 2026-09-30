@@ -80,6 +80,26 @@ class Settings(BaseSettings):
     # with graph_status "unavailable" or "partial" and a warning.
     graphrag_require_graph: bool = False
 
+    # --- LLM assistant (GraphRAG context -> grounded answer) ---
+    # The provider behind LLMProvider (see app/llm/provider.py): gemini, groq, openrouter
+    # (free tiers, OpenAI-compatible APIs), anthropic, or openai_compatible + LLM_BASE_URL.
+    llm_provider: str = "gemini"
+    # Empty: the provider's default model (gemini-flash-lite-latest for gemini).
+    llm_model: str = ""
+    # Empty: the provider's preset URL (only needed for openai_compatible).
+    llm_base_url: str = ""
+    # Empty: the provider's own variable (GEMINI_API_KEY, GROQ_API_KEY...). Never logged.
+    llm_api_key: SecretStr = SecretStr("")
+    # None: not sent (the model's default). Current Claude models reject it (HTTP 400).
+    llm_temperature: float | None = None
+    # Output limit per answer (the model's thinking counts too, so not too low).
+    llm_max_tokens: int = 16000
+    # Claude only: how much the model reasons (low, medium, high...). Empty: model default.
+    llm_effort: str = "medium"
+    llm_timeout_seconds: float = 120.0
+    # Retries of connection errors, 429 and 5xx by the provider's SDK (with backoff).
+    llm_max_retries: int = 2
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

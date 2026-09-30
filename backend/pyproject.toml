@@ -7,14 +7,15 @@ requires-python = ">=3.11"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-# Tests that need internet access, a server or a downloaded model are skipped by default.
-# Run them with: pytest -m network / neo4j / qdrant / embeddings
-addopts = "-m 'not network and not neo4j and not qdrant and not embeddings'"
+# Tests that need internet access, a server, a downloaded model or an API key are skipped by default.
+# Run them with: pytest -m network / neo4j / qdrant / embeddings / llm
+addopts = "-m 'not network and not neo4j and not qdrant and not embeddings and not llm'"
 markers = [
     "network: tests that need internet access",
     "neo4j: tests that need a running Neo4j server (docker compose up -d neo4j)",
     "qdrant: tests that need a running Qdrant server (docker compose up -d qdrant)",
     "embeddings: tests that run the real embedding model (downloaded on first use)",
+    "llm: tests that call the real LLM provider (needs an API key, costs a few cents)",
 ]
 filterwarnings = [
     # Unit tests use qdrant-client's in-memory mode, which has no payload indexes.

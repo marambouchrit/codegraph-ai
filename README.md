@@ -7,7 +7,7 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 11 — Chat API (with project analysis). Projects can be imported from GitHub or a ZIP file,
+> **Status:** Phase 13 — Knowledge graph visualization. Projects can be imported from GitHub or a ZIP file,
 > their source files are parsed, the files, classes, interfaces, functions and methods they
 > define are extracted, the relationships between them (imports, inheritance, calls, type uses,
 > file dependencies) are resolved, the result is stored as a knowledge graph in Neo4j that can
@@ -16,7 +16,7 @@ project — with answers grounded in the code and linked to source locations.
 > GraphRAG context (vector hits expanded through the graph), which an LLM turns into a grounded
 > answer citing numbered source locations; analysis features are built incrementally (see
 > [Roadmap](#roadmap)), available through `POST /projects/{id}/analyze` then
-> `POST /projects/{id}/chat`.
+> `POST /projects/{id}/chat`, and from a React frontend that also draws the knowledge graph.
 
 ## Tech stack
 
@@ -96,6 +96,8 @@ pytest -m llm        # calls the real LLM (needs LLM_API_KEY; free with a free-t
 | `GET`    | `/projects/{id}/files` | Detected source files                        |
 | `DELETE` | `/projects/{id}`       | Delete a project and its files               |
 | `POST`   | `/projects/{id}/analyze` | Build the graph and vector index: see [Analyze, then chat](#analyze-then-chat-api) |
+| `GET`    | `/projects/{id}/analysis` | Analysis state: see [Analysis state and knowledge graph](#analysis-state-and-knowledge-graph-api) |
+| `GET`    | `/projects/{id}/graph` | Bounded knowledge graph: same section |
 | `POST`   | `/projects/{id}/chat`  | Ask a question: see [Chat API](#chat-api)    |
 
 ```bash
@@ -524,7 +526,9 @@ Three calls take a project from source code to answers, with no Python snippet:
 ```bash
 curl -X POST http://localhost:8000/projects/zip -F "file=@my-project.zip"   # -> "id"
 curl -X POST http://localhost:8000/projects/<project_id>/analyze
-curl -X POST http://localhost:8000/projects/<project_id>/chat      -H "Content-Type: application/json"      -d '{"question": "How is authentication implemented?"}'
+curl -X POST http://localhost:8000/projects/<project_id>/chat \
+     -H "Content-Type: application/json" \
+     -d '{"question": "How is authentication implemented?"}'
 ```
 
 ```json
@@ -539,7 +543,8 @@ curl -X POST http://localhost:8000/projects/<project_id>/chat      -H "Content-T
               "embedding_model": "BAAI/bge-m3", "stale_chunks_removed": 0},
   "failed_files": 0,
   "warnings": [],
-  "duration_seconds": 6.951
+  "duration_seconds": 6.951,
+  "analyzed_at": "2026-10-02T18:30:00Z"
 }
 ```
 
@@ -548,10 +553,59 @@ curl -X POST http://localhost:8000/projects/<project_id>/chat      -H "Content-T
   Qdrant or the embedding model unavailable.
 - **Analyze again** after the code changes: both steps are idempotent, so nothing is
   duplicated and removed code is cleaned up (`stale_*_removed`).
-- **Synchronous:** the request returns when analysis is done. That takes a few seconds for a
-  small project and minutes for a large one on a CPU; the first call also loads BGE-M3.
+- **Synchronous:** the request returns when analysis is done. Almost all of the time is
+  embedding: building the graph of a 69-file project takes about 1 s. Measured on an Intel
+  i5-12450H CPU for that project (378 chunks):
+  - **BGE-M3** (the default): about 3.1 s per chunk, so about 20 minutes.
+  - **`BAAI/bge-base-en-v1.5`:** 4.7 minutes end to end. It is English-only, with 768
+    dimensions and 512 tokens.
+  - **To switch:** set `EMBEDDING_MODEL` and a new `QDRANT_COLLECTION` in `backend/.env`, see
+    "Changing the embedding model".
+  - Loading the model adds 10–30 s to the first call, and re-analysis embeds every chunk
+    again.
 - If indexing fails after the graph was built, the graph is kept and any previous vectors are
   untouched: analyze again to complete it.
+
+### Analysis state and knowledge graph (API)
+
+| Method | Endpoint | Returns |
+| --- | --- | --- |
+| `GET` | `/projects/{id}/analysis` | `status` (`not_analyzed` or `ready`) and the report of the last successful analysis |
+| `GET` | `/projects/{id}/graph?limit=150` | a bounded view of the project's Neo4j graph: nodes, edges, `truncated`, totals |
+
+**Analysis state.** A successful `POST /analyze` saves its report (the same counts, warnings
+and `analyzed_at`) in `backend/workspace/<id>/analysis.json`, next to `project.json`. So
+`GET /analysis` answers after a reload or a server restart, without querying any database. The
+file is removed when an analysis starts and written only once both steps succeeded: after a
+failed or interrupted analysis the project reads `not_analyzed`. Projects analyzed before this
+file existed also read `not_analyzed` until they are analyzed again.
+
+**Graph.** `GET /graph` returns up to `limit` nodes (1–500, default 150) and up to 2,000
+relationships between those nodes. Nodes come in a fixed order, structure first (files, then
+classes and interfaces, functions, methods), so a large project keeps its skeleton and the same
+project always gives the same graph. `truncated: true` says the project has more, and
+`total_nodes` / `total_edges` give its full size.
+
+```json
+{
+  "project_id": "57543d6494b949e2ba6aa33cc1a6f452",
+  "nodes": [{"id": "57543d…:auth/service.py:AuthService.login", "entity_type": "method",
+             "name": "login", "qualified_name": "AuthService.login", "file_path": "auth/service.py",
+             "language": "python", "start_line": 14, "end_line": 20}],
+  "edges": [{"id": "CALLS:…", "source": "…AuthService.login", "target": "…UserRepository.find_user",
+             "relationship_type": "CALLS"}],
+  "truncated": false,
+  "total_nodes": 17,
+  "total_edges": 26
+}
+```
+
+- **Fixed and read-only:** it is one more fixed, read-only query in `GraphRepository`, called
+  through `GraphRetrievalService`, and it is always filtered by `project_id`.
+- **Nothing to inject:** the client chooses `limit` only; any other query parameter is ignored,
+  and no Cypher, label or relationship type can be passed.
+- **Errors:** 404 unknown project, 422 invalid `limit`, 503 Neo4j unavailable. An unanalyzed
+  project returns an empty graph.
 
 ### Chat API
 
@@ -614,9 +668,34 @@ cp .env.example .env            # Windows cmd: copy .env.example .env
 npm run dev
 ```
 
-Open <http://localhost:5173>. The page shows the backend status by calling `GET /health`.
+Open <http://localhost:5173> (the backend must be running on port 8000).
 
-Other scripts: `npm run build`, `npm run lint`, `npm run typecheck`.
+- **Home (`/`):** import from a GitHub URL or a ZIP upload, and the list of imported projects.
+- **Project (`/projects/:id`):**
+  - The project's metadata.
+  - The **Analysis** panel. Its state comes from `GET /analysis`, so "Ready" and the counts
+    survive a reload. **Analyze Project** or **Analyze again** runs `POST /analyze`; there is no
+    fake progress bar.
+  - Two tabs, Chat and Knowledge Graph (below).
+- **Chat:**
+  - Markdown answers rendered safely (no raw HTML, no images, no `javascript:` links).
+  - `[n]` citations are buttons that highlight the matching source (file and lines).
+  - Graph status and warnings are shown when retrieval was degraded.
+- **Knowledge Graph:** the real Neo4j graph from `GET /graph`, drawn with
+  [Cytoscape.js](https://js.cytoscape.org/), which is loaded only when the tab is opened.
+  - Zoom (wheel, pinch or buttons), pan, and **Fit**.
+  - Colors and shapes per entity type, colors per relationship type.
+  - Relationship types can be hidden.
+  - **Find a node** by name.
+  - Clicking a node shows its type, qualified name, file, lines and language, plus its
+    incoming and outgoing relationships; each one can be followed to the other node.
+  - A truncated graph says so, with the totals, and the node limit can be raised up to 500.
+
+All HTTP calls are in `src/services/api.ts`, typed by `src/types/api.ts`, which mirrors the
+backend's Pydantic schemas.
+
+Scripts: `npm run dev`, `npm run build`, `npm run lint`, `npm run typecheck`, `npm test`
+(Vitest + Testing Library, with a fake backend: no server needed).
 
 ## Configuration
 
@@ -711,6 +790,13 @@ Imported code is treated as untrusted input:
 - **Analysis API:** `POST /projects/{id}/analyze` takes no body, only a validated project ID:
   the client cannot pass a path, Cypher, a filter or a model. The code is parsed, never run;
   Neo4j queries stay parameterized and every node and vector carries its project ID.
+- **Graph API:** `GET /projects/{id}/graph` is read-only and bounded (≤ 500 nodes, ≤ 2,000
+  relationships). It runs one fixed, parameterized query filtered by `project_id`; the client
+  can only choose the node limit (validated), never Cypher, labels or relationship types.
+  `GET /analysis` reads a JSON file in the project's own workspace folder.
+- **Frontend:** LLM output and repository metadata are rendered as text by React (no
+  `dangerouslySetInnerHTML`); Markdown answers drop raw HTML and images and sanitize links.
+  The browser only knows `VITE_API_URL`; no key or password reaches it.
 - **Chat API:** the client sends a natural-language question only. The body accepts one field
   (unknown fields such as `cypher`, `filter` or `system_prompt` are rejected with 422), the
   question is limited to 2000 characters, the project ID is validated before any file path is
@@ -738,8 +824,8 @@ Imported code is treated as untrusted input:
 9. ✅ GraphRAG (hybrid retrieval + context fusion)
 10. ✅ LLM assistant (grounded, cited answers)
 11. ✅ Chat API (`POST /projects/{id}/analyze`, `POST /projects/{id}/chat`)
-12. Frontend (import, dashboard, explorer, chat)
-13. Graph visualization
+12. ✅ Frontend (import, analysis, chat with citations)
+13. ✅ Graph visualization (persisted analysis state, `GET /projects/{id}/graph`, Cytoscape.js)
 14. Advanced analysis (impact, dependencies, architecture summary)
 15. Testing (integration, retrieval, end-to-end)
 16. Docker & finalization

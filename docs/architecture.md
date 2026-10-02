@@ -32,15 +32,15 @@ Question → query analysis
 
 | Component          | Responsibility                                      | Status   |
 | ------------------ | --------------------------------------------------- | -------- |
-| React frontend     | Import projects, explore code, chat, view the graph | Skeleton |
-| FastAPI backend    | HTTP API, orchestration                             | Project API, analysis API, chat API |
+| React frontend     | Import projects, explore code, chat, view the graph | ✅ Import, analysis, chat (12), graph (13) |
+| FastAPI backend    | HTTP API, orchestration                             | Project, analysis, graph and chat APIs |
 | Repository manager | Clone / extract / scan repositories                 | ✅ Phase 2 |
 | Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (3), entities (4), relationships (5) |
 | Graph engine       | Neo4j storage and graph queries                     | ✅ Storage (6), retrieval (7) |
 | RAG engine         | Chunking, embeddings, Qdrant, hybrid retrieval      | ✅ Vector search (8), GraphRAG (9) |
-| Chat engine        | Prompting and LLM provider abstraction              | ✅ Phase 10 (no endpoint yet) |
+| Chat engine        | Prompting and LLM provider abstraction              | ✅ Phase 10, endpoint in Phase 11 |
 
-## Current backend layout (Phase 11)
+## Current backend layout (Phase 13)
 
 ```
 backend/app/
@@ -55,11 +55,13 @@ backend/app/
 │   └── routes/
 │       ├── health.py        # GET /health
 │       ├── projects.py      # /projects endpoints (thin: call the service, return schemas)
-│       ├── analysis.py      # POST /projects/{id}/analyze
+│       ├── analysis.py      # POST /projects/{id}/analyze, GET /projects/{id}/analysis
+│       ├── graph.py         # GET /projects/{id}/graph (bounded, read-only)
 │       └── chat.py          # POST /projects/{id}/chat
 ├── schemas/                 # API request/response models
 │   ├── project.py
-│   ├── analysis.py          # AnalysisResponse (graph and vector summaries)
+│   ├── analysis.py          # AnalysisResponse, AnalysisStatusResponse
+│   ├── graph.py             # ProjectGraphResponse (nodes, edges, truncated, totals)
 │   └── chat.py              # ChatRequest (question only), ChatResponse, ChatSource
 ├── services/                # orchestration: the only places combining the packages below
 │   ├── project_service.py   # ingestion: workspace, clone/ZIP, scan, project.json
@@ -69,6 +71,8 @@ backend/app/
 │   ├── vector_retrieval_service.py # semantic search: validation, top_k, filters
 │   ├── graphrag_service.py  # GraphRAG: vector hits -> seeds -> graph expansion -> context
 │   ├── analysis_service.py  # analyze: project check -> graph build -> vector indexing
+│   ├── analysis_store.py    # analysis.json: the last successful analysis of a project
+│   ├── project_graph_service.py  # graph for display: project check -> bounded retrieval
 │   └── chat_service.py      # chat: project check -> GraphRAG -> LLM answer
 ├── ingestion/               # small, independent building blocks
 │   ├── github.py            # URL validation + safe shallow `git clone`
@@ -1211,7 +1215,126 @@ import -> analyze -> chat. `tests/test_analysis_integration.py`
 (`-m "neo4j and qdrant and embeddings and llm"`) does import -> analyze -> chat over HTTP on the
 real servers with Gemini.
 
+## Analysis state and knowledge graph API (Phase 13)
+
+Two small read endpoints, so the frontend can rely on the backend after a reload and draw the
+real graph.
+
+### Persisted analysis state: `GET /projects/{id}/analysis`
+
+```
+POST /analyze -> AnalysisService.analyze()
+                   1. project exists                      -> 404
+                   2. lock (one analysis per project)     -> 409
+                   3. AnalysisStore.clear()               analysis.json removed
+                   4. GraphService.build_project_graph()  (Phases 3-6)
+                   5. VectorIndexService.index_project()  (Phase 8)
+                   6. AnalysisStore.save(result)          analysis.json written
+GET /analysis -> AnalysisService.get_analysis() -> AnalysisStore.load()   (no database query)
+```
+
+- **Storage:** `services/analysis_store.py` keeps one JSON file per project,
+  `workspace/<id>/analysis.json`, next to `project.json`. It holds the two real reports
+  (`GraphBuildReport`, `VectorIndexReport`), the duration and `analyzed_at`. No graph or vector
+  data is copied, and no database was added.
+- **Statuses:** only `not_analyzed` and `ready`. There is no persisted "analyzing" state:
+  `POST /analyze` is synchronous and there are no background jobs.
+- **Never "ready" after a failure:** the record is cleared before any database changes and
+  written only after both steps succeeded. A failed or interrupted analysis therefore reads
+  `not_analyzed`, even if older data is still in Neo4j and Qdrant (which may now be a mix of
+  old and new). The file is written to a temporary file and then renamed, so a crash never
+  leaves half a record.
+- **Bad or missing records:** a missing, unreadable or foreign record (wrong project ID) means
+  `not_analyzed`, never a 500. That includes projects analyzed before Phase 13. Deleting the
+  project deletes its folder, and the record with it.
+- **Response:** `AnalysisStatusResponse` is `{project_id, status, analysis}`, where `analysis`
+  is the same `AnalysisResponse` that `POST /analyze` returned, including `analyzed_at`.
+
+### Graph for display: `GET /projects/{id}/graph?limit=`
+
+```
+routes/graph.py            limit validated by FastAPI (1..500) -> 422
+  -> ProjectGraphService     project exists (404) before any Neo4j connection
+  -> GraphRetrievalService   project ID and limit validated again (Phase 7 helpers)
+  -> GraphRepository.get_project_graph()
+        PROJECT_GRAPH_NODES   nodes of $project_id, fixed order, LIMIT $limit
+        PROJECT_GRAPH_EDGES   edges whose two ends are in $ids, type in $types, LIMIT $limit
+        statistics()          the existing count queries -> total_nodes, total_edges
+  -> ProjectGraphResponse    nodes, edges, truncated, total_nodes, total_edges
+```
+
+- **One new query shape:** Phase 7 only had per-entity questions (neighbors, callers,
+  paths...), so a whole-project view needed one more fixed, read-only query. It is in the
+  repository with the rest of the Cypher, and every value is a parameter.
+- **Bounded:**
+  - Up to `limit` nodes (default 150, max 500) and up to 2,000 edges, both between the
+    returned nodes.
+  - Each query asks for one extra row, so `truncated` is exact.
+  - The totals come from the existing statistics queries.
+- **Deterministic and useful when cut:** nodes are ordered by type rank (file, then class or
+  interface, then function, then method), then file path, start line and ID. Edges are ordered
+  by type, source, target and ID. A truncated graph keeps the project's structure, and the same
+  project always gives the same graph.
+- **Isolated:** both queries match `{project_id: $project_id}` on both ends of an edge.
+  Relationship types come from the fixed `RELATIONSHIP_TYPES` as a parameter, never from the
+  client.
+- **What the API exposes:**
+  - Nodes: `id`, `entity_type`, `name`, `qualified_name`, `file_path`, `language`,
+    `start_line`, `end_line`.
+  - Edges: `id`, `source`, `target`, `relationship_type`.
+  - Never: columns, the internal `build_id`, or anything from another project.
+- **Errors:** an unanalyzed project gives an empty graph. Neo4j down gives 503 through the
+  existing client error translation. Unknown or invalid projects give 404 before any connection.
+
+### Testing
+
+- **`tests/test_graph_api.py`:** real projects built by `GraphService` into the fake Neo4j. It
+  covers the real nodes and edges, the display fields, determinism, isolation, truncation by
+  nodes and by edges, an exact limit, invalid limits (422, no query), ignored extra parameters,
+  an empty graph, 404s, Neo4j down (503), a generic 500, lazy connections, OpenAPI and an
+  import check.
+- **`tests/test_analysis_api.py`:**
+  - state before and after analysis, a reload with a new service, and no database query on read
+  - re-analysis after a code change, and failed first or re-analysis (never `ready`)
+  - project isolation, legacy, unreadable and foreign records, deletion, OpenAPI
+- **`tests/retrieval_helpers.py` (opt-in, real Neo4j):** the project graph, full and
+  truncated, is one of the questions asked to both real Neo4j and the fake; their answers are
+  identical.
+
+## Frontend (Phases 12-13)
+
+React 19 + TypeScript + Vite. There's no global state library: the backend is the source of
+truth, and each page keeps its own state.
+
+```
+src/
+├── services/api.ts        every HTTP call (typed); errors -> safe messages (ApiError)
+├── types/api.ts           mirrors the Pydantic schemas field for field
+├── hooks/useAnalysis.ts   GET /analysis on mount, POST /analyze on demand
+├── pages/Home/            import (GitHub, ZIP) + project list
+├── pages/Project/         ProjectHeader, AnalysisPanel, tabs: Chat | Knowledge Graph
+└── components/
+    ├── Chat/              messages, safe Markdown, [n] citations -> sources
+    ├── SourceCitation/    file, lines, found_by, cited
+    └── GraphViewer/       GraphPanel (fetch, limit, legend, filters, search),
+                           GraphCanvas (Cytoscape.js, lazy-loaded), NodeDetails, graphStyle
+```
+
+- **Analysis state:** `useAnalysis` reads the persisted state, so "Ready" and the counts
+  survive a reload. A failure shows "Not analyzed", as the backend does.
+- **Graph viewer:** Cytoscape.js does the force-directed layout (non-random, so the same graph
+  looks the same), zoom, pan and selection. React owns the data: graph, selection and hidden
+  relationship types.
+  - Cytoscape is loaded with a dynamic `import()` when the tab is first opened, in its own
+    chunk.
+  - A `ResizeObserver` keeps its canvas the size of its container.
+  - A new node limit or a new analysis remounts the view, which loads the graph again.
+- **Tabs:** Chat and Knowledge Graph stay mounted once opened, so switching keeps the chat
+  history and the drawn graph.
+- **Tests:** Vitest, Testing Library and jsdom, with a fake backend that replaces `fetch`. In
+  jsdom (no canvas), `GraphCanvas` is replaced by a list of the nodes it receives, and the
+  conversion to Cytoscape elements is tested directly.
+
 ## Future packages
 
-New packages are added only when the phase that needs them is reached. Phase 12 builds the
-frontend (import, explore, chat) on top of the API.
+New packages are added only when the phase that needs them is reached.

@@ -33,14 +33,14 @@ Question → query analysis
 | Component          | Responsibility                                      | Status   |
 | ------------------ | --------------------------------------------------- | -------- |
 | React frontend     | Import projects, explore code, chat, view the graph | Skeleton |
-| FastAPI backend    | HTTP API, orchestration                             | Project API |
+| FastAPI backend    | HTTP API, orchestration                             | Project API, analysis API, chat API |
 | Repository manager | Clone / extract / scan repositories                 | ✅ Phase 2 |
 | Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (3), entities (4), relationships (5) |
 | Graph engine       | Neo4j storage and graph queries                     | ✅ Storage (6), retrieval (7) |
 | RAG engine         | Chunking, embeddings, Qdrant, hybrid retrieval      | ✅ Vector search (8), GraphRAG (9) |
 | Chat engine        | Prompting and LLM provider abstraction              | ✅ Phase 10 (no endpoint yet) |
 
-## Current backend layout (Phase 10)
+## Current backend layout (Phase 11)
 
 ```
 backend/app/
@@ -51,18 +51,25 @@ backend/app/
 │   ├── errors.py            # AppError + subclasses, each with an HTTP status code
 │   └── logging.py           # logging setup
 ├── api/
-│   ├── dependencies.py      # get_project_service() for Depends(...)
+│   ├── dependencies.py      # services for Depends(...); databases and models cached per process
 │   └── routes/
 │       ├── health.py        # GET /health
-│       └── projects.py      # /projects endpoints (thin: call the service, return schemas)
-├── schemas/project.py       # API request/response models
+│       ├── projects.py      # /projects endpoints (thin: call the service, return schemas)
+│       ├── analysis.py      # POST /projects/{id}/analyze
+│       └── chat.py          # POST /projects/{id}/chat
+├── schemas/                 # API request/response models
+│   ├── project.py
+│   ├── analysis.py          # AnalysisResponse (graph and vector summaries)
+│   └── chat.py              # ChatRequest (question only), ChatResponse, ChatSource
 ├── services/                # orchestration: the only places combining the packages below
 │   ├── project_service.py   # ingestion: workspace, clone/ZIP, scan, project.json
 │   ├── graph_service.py     # knowledge graph: analysis (Phases 3-5) -> Neo4j
 │   ├── graph_retrieval_service.py  # graph retrieval: validation, defaults, "not found"
 │   ├── vector_index_service.py     # vector index: files -> chunks -> embeddings -> Qdrant
 │   ├── vector_retrieval_service.py # semantic search: validation, top_k, filters
-│   └── graphrag_service.py  # GraphRAG: vector hits -> seeds -> graph expansion -> context
+│   ├── graphrag_service.py  # GraphRAG: vector hits -> seeds -> graph expansion -> context
+│   ├── analysis_service.py  # analyze: project check -> graph build -> vector indexing
+│   └── chat_service.py      # chat: project check -> GraphRAG -> LLM answer
 ├── ingestion/               # small, independent building blocks
 │   ├── github.py            # URL validation + safe shallow `git clone`
 │   ├── zip_handler.py       # safe ZIP extraction
@@ -1066,7 +1073,145 @@ answer, and "insufficient" for an unrelated question.
 Not in Phase 10, on purpose: API endpoints (Phase 11), streaming, conversation history, memory,
 agents or tools, reranking.
 
+## Chat API (Phase 11)
+
+**What it is:** the HTTP entry point to the assistant. One endpoint,
+`POST /projects/{project_id}/chat`, turns a question into the Phase 10 answer. The API layer
+only translates HTTP: no Cypher, no Qdrant call, no embedding, no prompt, no LLM SDK.
+
+```
+HTTP POST /projects/{id}/chat {"question": "..."}
+  → routes/chat.py        body validated by ChatRequest; calls the service; ChatResponse out
+  → ChatService.ask()     1. project exists (ProjectService)        → 404 first
+                          2. LLM service built (factory)            → 503 before any retrieval
+                          3. GraphRAGService.build_context()        → one retrieval (Phase 9)
+                          4. LLMGenerationService.generate(context) → answer (Phase 10)
+  → ChatResponse          answer, sources, cited, graph_status, warnings, model
+```
+
+### Request and response
+
+`ChatRequest`: `question`, 1 to 2000 characters after trimming (the vector search's own limit),
+and **no other field** (`extra="forbid"`): a client cannot pass Cypher, a Qdrant filter, a file
+path, a model, retrieval parameters or a system prompt. `ChatResponse` is built from the Phase 10
+`AssistantResponse` (no duplicated logic): each source becomes `{id, entity, entity_type, file,
+start_line, end_line, found_by, cited}`; entity IDs, chunk IDs, vector scores and graph queries
+stay internal. `graph_status` keeps Phase 9's values (`complete`, `partial`, `unavailable`).
+
+### Validation and errors
+
+The existing conventions are kept: bodies are validated by Pydantic (FastAPI answers 422 with
+details for a missing, empty, too long, wrongly typed or unexpected field, and for malformed
+JSON), and every application error goes through the single `AppError` handler, which returns
+`{"detail": message}` with the error's own status. An invalid project ID is a 404, as on every
+other `/projects/{id}` endpoint (the workspace validates the format before building a path).
+
+| Error | Status |
+| --- | --- |
+| `ProjectNotFoundError` (unknown or invalid ID) | 404 |
+| Invalid body | 422 |
+| `InvalidVectorQueryError` (lower-layer validation) | 400 |
+| `VectorStoreUnavailableError`, `EmbeddingModelError` | 503 |
+| `GraphDatabaseUnavailableError` (only with `GRAPHRAG_REQUIRE_GRAPH=true`; otherwise 200 with `graph_status` `unavailable`) | 503 |
+| `LLMConfigurationError`, `LLMUnavailableError` | 503 |
+| `LLMResponseError` | 502 |
+| anything unexpected | 500, generic body, logged server-side |
+
+Messages are the errors' own safe messages: they never contain API keys, passwords, headers,
+prompts or stack traces.
+
+### Dependency injection
+
+`get_chat_service()` gives the route a `ChatService` with the per-request `ProjectService` and
+two **factories**, `get_graphrag_service()` and `get_llm_generation_service()`. Both are cached
+per process (`lru_cache`): the Neo4j driver and Qdrant client (connection pools), the embedding
+model and the LLM client are built on the first chat request and reused, and nothing is
+connected at startup, so the other endpoints work without Neo4j, Qdrant or an LLM key. A failed
+creation (missing key) is not cached. The app's lifespan calls `close_chat_resources()` on
+shutdown. Tests replace `get_chat_service` through `app.dependency_overrides`.
+
+The route is a plain `def` (retrieval and the LLM call block), run in FastAPI's thread pool.
+Nothing is re-scanned, re-parsed, re-embedded or rebuilt per question: one GraphRAG call, one
+LLM call.
+
+### Testing
+
+`tests/test_chat_api.py` (no server, no model, no key): a real project imported from a ZIP, the
+Phase 9 test world as retrieval (real analysis, fake Neo4j, in-memory Qdrant) or a stub, and the
+real `LLMGenerationService` over the Phase 10 fake provider. It checks the success path and the
+response schema, sources with files and lines, graph unavailable (200 with status and warning),
+an unindexed project (no LLM call), 404 for unknown and invalid IDs with nothing else run, 422
+for every invalid body (including `cypher`, `filter`, `system_prompt`, `top_k` fields) and
+malformed JSON, retrieval and LLM errors with their status, LLM misconfiguration failing before
+retrieval, a 500 that leaks no secret or path, no secret in any response, the other endpoints,
+the OpenAPI documentation, CORS for the Vite dev server, and that the route and service import
+no database client, retrieval package, prompt builder or LLM SDK.
+`tests/test_chat_integration.py` (`-m "neo4j and qdrant and embeddings and llm"`) imports a
+ZIP, builds its graph and vector index on the real servers, and asks over HTTP.
+
+Not in Phase 11, on purpose: authentication, conversation history, streaming, rate limiting.
+Analysis was added right after, as Phase 11.5 (below).
+
+## Project analysis API (Phase 11.5)
+
+**What it is:** the missing step between import and chat. `POST /projects/{project_id}/analyze`
+(no body) prepares an imported project for chat, so no Python snippet is needed any more:
+
+```
+import  POST /projects/zip | /github   stores the source code (Phase 2)
+analyze POST /projects/{id}/analyze    builds the Neo4j graph + the Qdrant vector index
+chat    POST /projects/{id}/chat       GraphRAG over both indexes + LLM answer
+
+HTTP POST /projects/{id}/analyze
+  → routes/analysis.py        no body; calls the service; AnalysisResponse out
+  → AnalysisService.analyze() 1. project exists (ProjectService)          → 404 first
+                              2. one analysis per project at a time        → 409
+                              3. GraphService.build_project_graph()         (Phases 3-6)
+                              4. VectorIndexService.index_project()         (Phase 8, BGE-M3)
+  → AnalysisResponse          status "ready", graph and vector summaries, warnings
+```
+
+**Orchestration only:** no parsing, Cypher, chunking, embedding or Qdrant call in the route or
+the service. Both steps are the existing public methods, which already check the project, fail
+fast when their database is down, and are idempotent: MERGE plus stale cleanup by build ID
+(graph), deterministic point IDs plus stale cleanup by index ID (vectors). Analyzing again
+refreshes the project without duplicates. The graph runs first: Neo4j down fails in seconds,
+before the slow embedding step.
+
+**Failure safety:** a result is returned only when both steps succeeded. Any failure raises its
+own `AppError` (503 Neo4j, Qdrant or the embedding model unavailable, 500 generic for anything
+unexpected), so a project is never reported `ready` after a failed step. If indexing fails after
+the graph was built, the graph is kept (it is valid) and the previous vectors are untouched
+(Phase 8 deletes nothing on failure); analyzing again completes it. There is no stored
+"analyzed" state: chat on an unanalyzed project answers that the context is insufficient.
+
+**Concurrency:** two analyses of the same project at the same time would each delete what the
+other wrote as stale, so a second one is refused with 409 while the first runs (an in-process
+lock, enough for one API worker). Other projects are not blocked.
+
+**Response:** built from `GraphBuildReport` and `VectorIndexReport`: files, entities and
+relationships (with counts by type), unresolved references, chunks (by type), the embedding
+model, what stale data was removed, failed files, warnings and the duration. Build and index
+IDs, the vector dimension and Neo4j details stay internal.
+
+**Dependency injection:** `get_analysis_service()` gives factories for `GraphService` and
+`VectorIndexService`. They reuse the per-process Neo4j driver, Qdrant client and embedding model
+shared with chat, and nothing is connected before the project is found.
+
+**Synchronous on purpose:** the route is a plain `def` in FastAPI's thread pool and returns when
+analysis is done. That takes seconds for a small project and minutes for a large one on a CPU.
+There are no background jobs, queues or progress polling yet.
+
+**Testing:** `tests/test_analysis_api.py` (offline) runs the real `GraphService` and
+`VectorIndexService` over the fake Neo4j, an in-memory Qdrant and hashing embeddings. It covers
+the response against what the databases hold, re-analysis without duplicates, 404s with nothing
+touched, Neo4j down (no indexing started), indexing failures (never `ready`, previous vectors
+kept), a generic 500, 409 for concurrent runs, OpenAPI, the import rules, and
+import -> analyze -> chat. `tests/test_analysis_integration.py`
+(`-m "neo4j and qdrant and embeddings and llm"`) does import -> analyze -> chat over HTTP on the
+real servers with Gemini.
+
 ## Future packages
 
-New packages are added only when the phase that needs them is reached. Phase 11 will expose
-`GraphRAGService` + `LLMGenerationService` through the API and the frontend chat.
+New packages are added only when the phase that needs them is reached. Phase 12 builds the
+frontend (import, explore, chat) on top of the API.

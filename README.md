@@ -7,7 +7,7 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 10 — LLM assistant. Projects can be imported from GitHub or a ZIP file,
+> **Status:** Phase 11 — Chat API (with project analysis). Projects can be imported from GitHub or a ZIP file,
 > their source files are parsed, the files, classes, interfaces, functions and methods they
 > define are extracted, the relationships between them (imports, inheritance, calls, type uses,
 > file dependencies) are resolved, the result is stored as a knowledge graph in Neo4j that can
@@ -15,7 +15,8 @@ project — with answers grounded in the code and linked to source locations.
 > for semantic search with a local embedding model, and both are combined into structured
 > GraphRAG context (vector hits expanded through the graph), which an LLM turns into a grounded
 > answer citing numbered source locations; analysis features are built incrementally (see
-> [Roadmap](#roadmap)). No chat endpoint yet (Phase 11).
+> [Roadmap](#roadmap)), available through `POST /projects/{id}/analyze` then
+> `POST /projects/{id}/chat`.
 
 ## Tech stack
 
@@ -94,6 +95,8 @@ pytest -m llm        # calls the real LLM (needs LLM_API_KEY; free with a free-t
 | `GET`    | `/projects/{id}`       | Project details and per-language file counts |
 | `GET`    | `/projects/{id}/files` | Detected source files                        |
 | `DELETE` | `/projects/{id}`       | Delete a project and its files               |
+| `POST`   | `/projects/{id}/analyze` | Build the graph and vector index: see [Analyze, then chat](#analyze-then-chat-api) |
+| `POST`   | `/projects/{id}/chat`  | Ask a question: see [Chat API](#chat-api)    |
 
 ```bash
 curl -X POST http://localhost:8000/projects/github \
@@ -506,6 +509,102 @@ See [docs/architecture.md](docs/architecture.md#llm-assistant-phase-10).
 network, no key). `pytest -m llm` asks the real model two questions (needs a key; free with a
 free-tier key).
 
+### Analyze, then chat (API)
+
+Three calls take a project from source code to answers, with no Python snippet:
+
+1. **Import** (`POST /projects/zip` or `/projects/github`) stores the source code. Nothing is
+   analyzed yet.
+2. **Analyze** (`POST /projects/{id}/analyze`, no body) builds the Neo4j knowledge graph
+   (Phases 3–6) and the Qdrant vector index with BGE-M3 (Phase 8), by calling the same
+   `GraphService` and `VectorIndexService` shown above.
+3. **Chat** (`POST /projects/{id}/chat`) queries both indexes through GraphRAG (see
+   [Chat API](#chat-api)).
+
+```bash
+curl -X POST http://localhost:8000/projects/zip -F "file=@my-project.zip"   # -> "id"
+curl -X POST http://localhost:8000/projects/<project_id>/analyze
+curl -X POST http://localhost:8000/projects/<project_id>/chat      -H "Content-Type: application/json"      -d '{"question": "How is authentication implemented?"}'
+```
+
+```json
+{
+  "project_id": "449fc24fe9744306bf10670bd9a7bfac",
+  "status": "ready",
+  "graph": {"files": 4, "entities": 17, "relationships": 26,
+            "entities_by_type": {"Class": 4, "File": 4, "Function": 2, "Method": 7},
+            "relationships_by_type": {"CALLS": 8, "CONTAINS": 13, "DEPENDS_ON": 2, "IMPORTS": 2, "INHERITS": 1},
+            "unresolved_references": 8, "stale_entities_removed": 0},
+  "vectors": {"files": 4, "chunks": 15, "chunks_by_type": {"class": 4, "file": 2, "function": 2, "method": 7},
+              "embedding_model": "BAAI/bge-m3", "stale_chunks_removed": 0},
+  "failed_files": 0,
+  "warnings": [],
+  "duration_seconds": 6.951
+}
+```
+
+- `status` is `ready` only when both the graph and the vector index were built. Any failure
+  returns an error instead: 404 unknown project, 409 already being analyzed, 503 Neo4j,
+  Qdrant or the embedding model unavailable.
+- **Analyze again** after the code changes: both steps are idempotent, so nothing is
+  duplicated and removed code is cleaned up (`stale_*_removed`).
+- **Synchronous:** the request returns when analysis is done. That takes a few seconds for a
+  small project and minutes for a large one on a CPU; the first call also loads BGE-M3.
+- If indexing fails after the graph was built, the graph is kept and any previous vectors are
+  untouched: analyze again to complete it.
+
+### Chat API
+
+Ask a question about an imported project over HTTP: the endpoint runs GraphRAG and the LLM
+assistant described above and returns the answer with its sources.
+
+| Method | Endpoint | Body | Returns |
+| --- | --- | --- | --- |
+| `POST` | `/projects/{id}/chat` | `{"question": "..."}` (1–2000 characters, nothing else) | answer, numbered sources, status |
+
+**Before chatting**, the project must be analyzed (`POST /projects/{id}/analyze`, see
+[Analyze, then chat](#analyze-then-chat-api)), and `LLM_API_KEY` must be set. An unindexed project gets "The available repository context is
+insufficient..." instead of an answer.
+
+```bash
+curl -X POST http://localhost:8000/projects/<project_id>/chat \
+     -H "Content-Type: application/json" \
+     -d '{"question": "How is authentication implemented?"}'
+```
+
+```json
+{
+  "question": "How is authentication implemented?",
+  "answer": "Authentication is handled by `AuthService.login` [1], which loads the user with `UserRepository.find_user` [3]...",
+  "sources": [
+    {"id": 1, "entity": "AuthService.login", "entity_type": "method", "file": "auth/service.py",
+     "start_line": 14, "end_line": 20, "found_by": "semantic_search", "cited": true},
+    {"id": 3, "entity": "UserRepository.find_user", "entity_type": "method", "file": "repository/user.py",
+     "start_line": 7, "end_line": 9, "found_by": "graph", "cited": true}
+  ],
+  "cited": [1, 3],
+  "graph_status": "complete",
+  "warnings": [],
+  "model": "gemini-flash-lite-latest"
+}
+```
+
+- `sources`: every piece of code given to the model, numbered as the answer cites it (`[1]`),
+  with its file and line range; `found_by` says whether semantic search found it or the
+  knowledge graph connected it; `cited` whether the answer uses it.
+- `graph_status`: `complete`, or `partial` / `unavailable` when Neo4j failed (the answer then
+  relies on semantic search only, with a warning).
+- Errors use the usual `{"detail": ...}` shape: 404 unknown project, 422 invalid body (empty
+  or too long question, unknown field), 502 no usable LLM answer, 503 Qdrant, embedding model
+  or LLM unavailable or misconfigured. Messages never contain keys or passwords.
+- Interactive documentation, with the schemas and examples: <http://localhost:8000/docs>.
+- The first question after starting the server also loads the embedding model (about 20–30 s
+  on a CPU); the next ones reuse it.
+
+**Tests:** `pytest` covers both endpoints with fake databases, fake retrieval and a fake LLM
+(no server, no key). `pytest -m "neo4j and qdrant and embeddings and llm"` runs import ->
+analyze -> chat over HTTP with every real service.
+
 ### Frontend
 
 ```bash
@@ -609,6 +708,14 @@ Imported code is treated as untrusted input:
 - **GraphRAG** only combines the typed operations above (no Cypher or Qdrant filter of its own),
   keeps every result in the requested project, expands one hop per seed with bounded paths, and
   never calls an external service.
+- **Analysis API:** `POST /projects/{id}/analyze` takes no body, only a validated project ID:
+  the client cannot pass a path, Cypher, a filter or a model. The code is parsed, never run;
+  Neo4j queries stay parameterized and every node and vector carries its project ID.
+- **Chat API:** the client sends a natural-language question only. The body accepts one field
+  (unknown fields such as `cypher`, `filter` or `system_prompt` are rejected with 422), the
+  question is limited to 2000 characters, the project ID is validated before any file path is
+  built, and retrieval limits, prompts and the model come from the server's configuration.
+  Unexpected errors return a generic 500, never a stack trace.
 - **LLM assistant:** the model is treated as an untrusted generator and repository code as
   untrusted data. Instructions live only in the system prompt; the repository context and the
   question go in the user message inside delimited sections, **XML-escaped**, so code or a
@@ -629,9 +736,10 @@ Imported code is treated as untrusted input:
 7. ✅ Graph retrieval
 8. ✅ Vector RAG (chunking, embeddings, Qdrant)
 9. ✅ GraphRAG (hybrid retrieval + context fusion)
-10. ✅ LLM assistant (grounded, cited answers; the chat endpoint comes next)
-11. Frontend (import, dashboard, explorer, chat)
-12. Graph visualization
-13. Advanced analysis (impact, dependencies, architecture summary)
-14. Testing (integration, retrieval, end-to-end)
-15. Docker & finalization
+10. ✅ LLM assistant (grounded, cited answers)
+11. ✅ Chat API (`POST /projects/{id}/analyze`, `POST /projects/{id}/chat`)
+12. Frontend (import, dashboard, explorer, chat)
+13. Graph visualization
+14. Advanced analysis (impact, dependencies, architecture summary)
+15. Testing (integration, retrieval, end-to-end)
+16. Docker & finalization

@@ -1,0 +1,44 @@
+.project-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.project-title h1 {
+  margin: 0;
+  font-size: clamp(1.4rem, 3vw, 1.8rem);
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+.project-source-line {
+  margin: 4px 0 16px;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.project-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px 24px;
+  margin: 0;
+}
+
+.project-facts dt {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.project-facts dd {
+  margin: 2px 0 0;
+  font-weight: 600;
+}
+
+.languages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}

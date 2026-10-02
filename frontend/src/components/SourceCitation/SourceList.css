@@ -1,0 +1,96 @@
+.sources {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.sources-title {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.source-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.source {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  scroll-margin: 80px;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.source.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.source-id {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-weight: 700;
+}
+
+.source-body {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.source-head,
+.source-location {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.source-entity {
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.source-location {
+  font-size: 0.88rem;
+}
+
+.source-location code {
+  word-break: break-all;
+}
+
+.copy {
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.copy:hover {
+  color: var(--text);
+}
+
+.other-sources {
+  margin-top: 8px;
+}
+
+.other-sources summary {
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: 0.88rem;
+  cursor: pointer;
+}

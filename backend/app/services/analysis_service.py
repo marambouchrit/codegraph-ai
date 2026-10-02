@@ -3,7 +3,8 @@
     AnalysisService (this module)  the order of the steps, nothing else
         ├── ProjectService             does the project exist?                (Phase 2)
         ├── GraphService               parse, extract, write to Neo4j         (Phases 3-6)
-        └── VectorIndexService         chunk, embed (BGE-M3), write to Qdrant (Phase 8)
+        ├── VectorIndexService         chunk, embed (BGE-M3), write to Qdrant (Phase 8)
+        └── AnalysisStore              remembers the last successful analysis  (Phase 13)
 
 No parsing, no Cypher, no embedding, no Qdrant call here: both services already do
 it, and both are idempotent (MERGE + stale cleanup by build ID; deterministic point
@@ -17,6 +18,11 @@ ready after a failed step. If indexing fails after the graph was built, the grap
 is kept (it is valid) and the previous vectors, if any, are untouched; analyzing
 again completes it.
 
+The stored record (AnalysisStore, read by GET /projects/{id}/analysis) follows the
+same rule: it is cleared when an analysis starts and written only once both steps
+succeeded. After a failure or a crash the project reads as "not analyzed" until it
+is analyzed again, even if older data is still in Neo4j and Qdrant.
+
 Two analyses of the same project at the same time are refused (409): each build
 removes what the other wrote as "stale". This lock is per process (one API worker).
 """
@@ -26,12 +32,12 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Protocol
 
 from app.core.errors import AnalysisInProgressError
 from app.graph.models import GraphBuildReport
 from app.rag.models import VectorIndexReport
+from app.services.analysis_store import AnalysisResult, AnalysisStore
 from app.services.project_service import ProjectService
 
 logger = logging.getLogger(__name__)
@@ -47,15 +53,6 @@ class ProjectVectorIndexer(Protocol):
     """What the analysis needs from VectorIndexService."""
 
     def index_project(self, project_id: str) -> VectorIndexReport: ...
-
-
-@dataclass(frozen=True)
-class AnalysisResult:
-    """Both reports of a successful analysis."""
-
-    graph: GraphBuildReport
-    vectors: VectorIndexReport
-    duration_seconds: float
 
 
 _running: set[str] = set()
@@ -85,18 +82,27 @@ class AnalysisService:
         vectors: Callable[[], ProjectVectorIndexer],
     ) -> None:
         self.project_service = project_service
+        self.store = AnalysisStore(project_service.workspace)
         self._graph = graph
         self._vectors = vectors
+
+    def get_analysis(self, project_id: str) -> AnalysisResult | None:
+        """The last successful analysis, None if never analyzed (404 if unknown project)."""
+        self.project_service.get_project(project_id)
+        return self.store.load(project_id)
 
     def analyze(self, project_id: str) -> AnalysisResult:
         """Build the graph, then the vector index (ProjectNotFoundError if unknown)."""
         self.project_service.get_project(project_id)  # invalid or unknown ID: 404, first
         with _exclusive(project_id):
+            # From now on the databases may change: "ready" only once both steps succeeded.
+            self.store.clear(project_id)
             started = time.perf_counter()
             # Graph first: Neo4j down fails in seconds, before the slow embedding step.
             graph = self._graph().build_project_graph(project_id)
             vectors = self._vectors().index_project(project_id)
             result = AnalysisResult(graph, vectors, round(time.perf_counter() - started, 3))
+            self.store.save(project_id, result)
         logger.info("Project %s analyzed in %.1f s: %s; %s", project_id, result.duration_seconds,
                     graph.summary, vectors.summary)  # fmt: skip
         return result

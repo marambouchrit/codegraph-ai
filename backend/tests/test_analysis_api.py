@@ -9,6 +9,7 @@ import ast
 import io
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -118,7 +119,7 @@ def test_analysis_builds_the_graph_and_the_vector_index(analysis: Analysis) -> N
     assert response.status_code == 200, response.text
     body = response.json()
     assert set(body) == {"project_id", "status", "graph", "vectors", "failed_files",
-                         "warnings", "duration_seconds"}  # fmt: skip
+                         "warnings", "duration_seconds", "analyzed_at"}  # fmt: skip
     assert body["project_id"] == analysis.project_id and body["status"] == "ready"
     assert body["failed_files"] == 0 and body["warnings"] == []
     # What the response says is what the databases hold.
@@ -372,3 +373,166 @@ def test_the_route_and_service_only_orchestrate() -> None:
                 ]  # fmt: skip
                 for name in names:
                     assert not name.startswith(forbidden), f"{path.name} imports {name}"
+
+
+# ----- Persisted analysis state: GET /projects/{id}/analysis (Phase 13) -----
+
+
+def state(analysis: Analysis, project_id: str | None = None) -> Any:
+    return analysis.client.get(f"/projects/{project_id or analysis.project_id}/analysis")
+
+
+def test_a_new_project_is_not_analyzed(analysis: Analysis) -> None:
+    response = state(analysis)
+
+    assert response.status_code == 200
+    assert response.json() == {"project_id": analysis.project_id, "status": "not_analyzed",
+                               "analysis": None}  # fmt: skip
+
+
+def test_an_analyzed_project_is_ready_with_the_real_report(analysis: Analysis) -> None:
+    analyzed = analysis.analyze().json()
+
+    body = state(analysis).json()
+
+    assert body["status"] == "ready"
+    assert body["analysis"] == analyzed  # the same report, counts included
+    assert body["analysis"]["graph"]["entities"] == len(analysis.database.nodes)
+    assert body["analysis"]["vectors"]["chunks"] == analysis.store.count(analysis.project_id)
+
+
+def test_the_state_survives_a_reload(analysis: Analysis, settings: Settings) -> None:
+    """A new service (new request, restarted server) reads the state from the workspace."""
+    analyzed = analysis.analyze().json()
+    restarted = AnalysisService(ProjectService(settings), _unused, _unused)
+
+    result = restarted.get_analysis(analysis.project_id)
+
+    assert result is not None
+    assert result.graph.nodes_written == analyzed["graph"]["entities"]
+    assert result.analyzed_at.isoformat().replace("+00:00", "Z") == analyzed["analyzed_at"]
+
+
+def test_reading_the_state_queries_no_database(analysis: Analysis) -> None:
+    analysis.analyze()
+    analysis.database.queries.clear()
+    builds = (len(analysis.graph_builds), len(analysis.vector_builds))
+
+    assert state(analysis).json()["status"] == "ready"
+    assert analysis.database.queries == []
+    assert (len(analysis.graph_builds), len(analysis.vector_builds)) == builds
+
+
+def test_re_analysis_updates_the_state(analysis: Analysis, settings: Settings) -> None:
+    first = analysis.analyze().json()
+    source = ProjectService(settings).workspace.source_dir(analysis.project_id)
+    (source / "extra.py").write_text("def extra():\n    return 1\n", encoding="utf-8")
+
+    second = analysis.analyze().json()
+
+    body = state(analysis).json()
+    assert body["analysis"] == second
+    assert second["analyzed_at"] > first["analyzed_at"]
+    assert second["graph"]["entities"] == first["graph"]["entities"] + 2  # a file + a function
+    assert second["vectors"]["files"] == first["vectors"]["files"] + 1
+
+
+def test_a_failed_first_analysis_is_not_ready(analysis: Analysis) -> None:
+    analysis.embeddings = FailingEmbeddings(fail_after=0)
+
+    assert analysis.analyze().status_code == 503
+    assert state(analysis).json()["status"] == "not_analyzed"
+
+
+def test_a_failed_re_analysis_is_not_ready(analysis: Analysis) -> None:
+    assert analysis.analyze().status_code == 200
+    analysis.graph_error = RuntimeError("boom")
+
+    assert analysis.analyze().status_code == 500
+    # The databases may hold a mix of old and new data: never report "ready" for it.
+    assert state(analysis).json() == {"project_id": analysis.project_id,
+                                      "status": "not_analyzed", "analysis": None}  # fmt: skip
+
+
+def test_a_refused_concurrent_analysis_keeps_the_state(analysis: Analysis, settings: Settings) -> None:
+    assert analysis.analyze().status_code == 200
+    service = analysis.service()
+    with _exclusive_for_test(analysis.project_id):
+        with pytest.raises(AnalysisInProgressError):
+            service.analyze(analysis.project_id)
+
+    assert state(analysis).json()["status"] == "ready"  # the running analysis decides
+
+
+def test_projects_have_separate_states(analysis: Analysis, settings: Settings, make_zip: MakeZip) -> None:
+    other = ProjectService(settings).create_from_zip(io.BytesIO(make_zip(FILES)), "b.zip")
+
+    analysis.analyze()
+
+    assert state(analysis).json()["status"] == "ready"
+    assert state(analysis, other.id).json()["status"] == "not_analyzed"
+
+
+@pytest.mark.parametrize("project_id", ["f" * 32, "not-a-valid-id", "..%2F..%2Fetc", "A" * 32])
+def test_the_state_of_an_unknown_or_invalid_project_is_404(analysis: Analysis, project_id: str) -> None:
+    assert state(analysis, project_id).status_code == 404
+
+
+def test_a_project_analyzed_before_the_state_existed_is_not_analyzed(
+    analysis: Analysis, settings: Settings
+) -> None:
+    """No analysis.json (analyzed before Phase 13): honest "not_analyzed", never a 500."""
+    analysis.analyze()
+    ProjectService(settings).workspace.analysis_file(analysis.project_id).unlink()
+
+    assert state(analysis).json()["status"] == "not_analyzed"
+
+
+@pytest.mark.parametrize("content", ["{not json", "{}", '{"graph": {"unknown": 1}}', "[]"])
+def test_an_unreadable_record_is_not_analyzed(analysis: Analysis, settings: Settings, content: str) -> None:
+    ProjectService(settings).workspace.analysis_file(analysis.project_id).write_text(content)
+
+    response = state(analysis)
+
+    assert response.status_code == 200 and response.json()["status"] == "not_analyzed"
+
+
+def test_a_record_of_another_project_is_ignored(
+    analysis: Analysis, settings: Settings, make_zip: MakeZip
+) -> None:
+    other = ProjectService(settings).create_from_zip(io.BytesIO(make_zip(FILES)), "b.zip")
+    analysis.analyze()
+    workspace = ProjectService(settings).workspace
+    workspace.analysis_file(other.id).write_text(
+        workspace.analysis_file(analysis.project_id).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    assert state(analysis, other.id).json()["status"] == "not_analyzed"
+
+
+def test_deleting_a_project_deletes_its_state(analysis: Analysis) -> None:
+    analysis.analyze()
+
+    assert analysis.client.delete(f"/projects/{analysis.project_id}").status_code == 204
+    assert state(analysis).status_code == 404
+
+
+def test_the_state_endpoint_is_documented(analysis: Analysis) -> None:
+    paths = analysis.client.get("/openapi.json").json()["paths"]
+    operation = paths["/projects/{project_id}/analysis"]["get"]
+
+    assert operation["summary"] == "Get the analysis state of a project"
+    assert "404" in operation["responses"]
+
+
+def _unused() -> Any:
+    raise AssertionError("reading the state must not build a service")
+
+
+@contextmanager
+def _exclusive_for_test(project_id: str) -> Iterator[None]:
+    """Hold the analysis lock of a project, as a running analysis does."""
+    from app.services import analysis_service
+
+    with analysis_service._exclusive(project_id):
+        yield

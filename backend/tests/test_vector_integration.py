@@ -99,7 +99,7 @@ def test_the_same_answers_as_the_in_memory_qdrant(
 
 
 # Dimensions published on the model cards, to catch a model that is not the one expected.
-KNOWN_DIMENSIONS = {"BAAI/bge-m3": 1024, "BAAI/bge-small-en-v1.5": 384}
+KNOWN_DIMENSIONS = {"BAAI/bge-m3": 1024, "BAAI/bge-base-en-v1.5": 768, "BAAI/bge-small-en-v1.5": 384}
 
 
 @pytest.fixture(scope="module")

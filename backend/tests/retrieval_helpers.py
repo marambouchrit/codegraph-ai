@@ -185,4 +185,6 @@ QUESTIONS: dict[str, Question] = {
         p, full(p, SAVE), full(p, VALIDATE), directed=False, relationship_types=["CALLS"]
     ),
     "no path": lambda s, p: s.find_paths(p, full(p, WRITE), full(p, LOGIN)),
+    "project graph": lambda s, p: s.get_project_graph(p),
+    "project graph, truncated": lambda s, p: s.get_project_graph(p, limit=3),
 }

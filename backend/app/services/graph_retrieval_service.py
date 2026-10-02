@@ -33,6 +33,7 @@ from app.graph.models import (
     EntityResult,
     GraphContext,
     GraphPath,
+    ProjectGraph,
     RelatedEntity,
 )
 from app.graph.repository import MAX_TRAVERSAL_DEPTH, GraphRepository
@@ -47,11 +48,32 @@ DEFAULT_PATH_LIMIT = 5
 MAX_PATH_LIMIT = 20  # a path carries several entities: fewer paths than entities
 MAX_SEARCH_LENGTH = 500
 MAX_ID_LENGTH = 4096  # entity IDs contain a file path and a qualified name
+DEFAULT_GRAPH_NODES = 150  # whole-project graph for display: readable in a browser
+MAX_GRAPH_NODES = 500
+MAX_GRAPH_EDGES = 2000  # between the returned nodes
 
 
 class GraphRetrievalService:
     def __init__(self, repository: GraphRepository) -> None:
         self.repository = repository
+
+    # ----- Whole project -----
+
+    def get_project_graph(
+        self, project_id: str, limit: int = DEFAULT_GRAPH_NODES
+    ) -> ProjectGraph:
+        """A bounded, deterministic view of the project's graph, for display.
+
+        Up to `limit` nodes (files first, then classes and interfaces, functions,
+        methods) and up to MAX_GRAPH_EDGES edges between them; `nodes_truncated` and
+        `edges_truncated` say whether the project has more. An unanalyzed project has
+        an empty graph.
+        """
+        return self.repository.get_project_graph(
+            _project(project_id),
+            node_limit=_limit(limit, MAX_GRAPH_NODES),
+            edge_limit=MAX_GRAPH_EDGES,
+        )
 
     # ----- Entities -----
 

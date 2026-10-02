@@ -1,9 +1,10 @@
-"""API model (response body) for the analysis endpoint.
+"""API models (response bodies) for the analysis endpoints.
 
 Built from the Phase 6 GraphBuildReport and the Phase 8 VectorIndexReport; internal
 details (build and index IDs, vector dimension, Neo4j queries) are not exposed.
 """
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -53,6 +54,7 @@ class AnalysisResponse(BaseModel):
                     "failed_files": 0,
                     "warnings": [],
                     "duration_seconds": 14.2,
+                    "analyzed_at": "2026-10-02T18:30:00Z",
                 }
             ]
         }
@@ -67,6 +69,7 @@ class AnalysisResponse(BaseModel):
     failed_files: int = Field(description="Files that could not be read or parsed (skipped)")
     warnings: list[str]
     duration_seconds: float
+    analyzed_at: datetime = Field(description="When this analysis finished (UTC)")
 
     @classmethod
     def from_result(cls, project_id: str, result: AnalysisResult) -> "AnalysisResponse":
@@ -99,4 +102,30 @@ class AnalysisResponse(BaseModel):
             failed_files=failed_files,
             warnings=warnings,
             duration_seconds=result.duration_seconds,
+            analyzed_at=result.analyzed_at,
+        )
+
+
+class AnalysisStatusResponse(BaseModel):
+    """Whether a project is ready for chat, from the last successful analysis."""
+
+    project_id: str
+    status: Literal["not_analyzed", "ready"] = Field(
+        description="ready: the last analysis succeeded; not_analyzed: never analyzed, or "
+        "the last analysis failed or was interrupted (analyze again)"
+    )
+    analysis: AnalysisResponse | None = Field(
+        description="The report of the last successful analysis; null when not analyzed"
+    )
+
+    @classmethod
+    def from_result(
+        cls, project_id: str, result: AnalysisResult | None
+    ) -> "AnalysisStatusResponse":
+        if result is None:
+            return cls(project_id=project_id, status="not_analyzed", analysis=None)
+        return cls(
+            project_id=project_id,
+            status="ready",
+            analysis=AnalysisResponse.from_result(project_id, result),
         )

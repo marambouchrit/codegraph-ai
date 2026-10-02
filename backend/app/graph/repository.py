@@ -39,6 +39,7 @@ from app.graph.models import (
     GraphNode,
     GraphPath,
     GraphStatistics,
+    ProjectGraph,
     RelatedEntity,
     RelationshipResult,
 )
@@ -140,6 +141,29 @@ RETURN type(r) AS type, count(*) AS count
 GET_ENTITY = f"""
 MATCH (n:{ENTITY_LABEL} {{id: $entity_id, project_id: $project_id}})
 RETURN properties(n) AS entity
+"""
+
+# A bounded view of a whole project's graph, for display (GET /projects/{id}/graph).
+# Nodes in a fixed order, structure first (files, then classes and interfaces, then
+# functions, then methods), so a truncated graph keeps its skeleton and the same
+# project always gives the same graph. $limit is the caller's limit + 1: one extra
+# row tells whether there was more.
+PROJECT_GRAPH_NODES = f"""
+MATCH (n:{ENTITY_LABEL} {{project_id: $project_id}})
+RETURN properties(n) AS entity
+ORDER BY CASE n.entity_type
+    WHEN 'file' THEN 0 WHEN 'class' THEN 1 WHEN 'interface' THEN 1 WHEN 'function' THEN 2
+    ELSE 3 END, n.file_path, n.start_line, n.id
+LIMIT $limit
+"""
+
+# The relationships between the selected nodes only (both ends in $ids), of our own types.
+PROJECT_GRAPH_EDGES = f"""
+MATCH (source:{ENTITY_LABEL} {{project_id: $project_id}})-[r]->(target:{ENTITY_LABEL} {{project_id: $project_id}})
+WHERE source.id IN $ids AND target.id IN $ids AND type(r) IN $types
+RETURN type(r) AS type, properties(r) AS relationship, source.id AS source_id, target.id AS target_id
+ORDER BY type, source_id, target_id, r.id
+LIMIT $limit
 """
 
 # Exact matches first (ID, then qualified name, then name), then partial matches if
@@ -333,6 +357,40 @@ class GraphRepository:
     # These methods trust their arguments to be sensible (the service validates limits
     # and turns "not found" into errors); they only refuse what could change the query
     # text: unknown relationship types, directions or depths.
+
+    def get_project_graph(
+        self, project_id: str, *, node_limit: int, edge_limit: int
+    ) -> ProjectGraph:
+        """Up to `node_limit` nodes of the project and up to `edge_limit` edges between them."""
+        rows = self._read(PROJECT_GRAPH_NODES, {"project_id": project_id, "limit": node_limit + 1})
+        nodes = [EntityResult.from_properties(row["entity"]) for row in rows[:node_limit]]
+        edges: list[RelationshipResult] = []
+        edges_truncated = False
+        if nodes:
+            parameters = {
+                "project_id": project_id,
+                "ids": [node.id for node in nodes],
+                "types": sorted(RELATIONSHIP_TYPES),
+                "limit": edge_limit + 1,
+            }
+            edge_rows = self._read(PROJECT_GRAPH_EDGES, parameters)
+            edges = [
+                RelationshipResult.from_record(
+                    row["type"], row["relationship"], row["source_id"], row["target_id"]
+                )
+                for row in edge_rows[:edge_limit]
+            ]
+            edges_truncated = len(edge_rows) > edge_limit
+        totals = self.statistics(project_id)
+        return ProjectGraph(
+            project_id=project_id,
+            nodes=tuple(nodes),
+            edges=tuple(edges),
+            nodes_truncated=len(rows) > node_limit,
+            edges_truncated=edges_truncated,
+            total_nodes=sum(totals.nodes_by_label.values()),
+            total_edges=sum(totals.relationships_by_type.values()),
+        )
 
     def get_entity(self, project_id: str, entity_id: str) -> EntityResult | None:
         rows = self._read(GET_ENTITY, {"project_id": project_id, "entity_id": entity_id})

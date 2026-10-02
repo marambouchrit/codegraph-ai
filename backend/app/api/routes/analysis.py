@@ -1,4 +1,5 @@
-"""Analysis endpoint: prepare an imported project for chat (knowledge graph + vector index).
+"""Analysis endpoints: prepare an imported project for chat (knowledge graph + vector index),
+and tell whether it is ready.
 
 The route only translates HTTP to a service call and back: the workflow is in
 AnalysisService, every error goes through the global AppError handler (app/main.py).
@@ -7,7 +8,7 @@ AnalysisService, every error goes through the global AppError handler (app/main.
 from fastapi import APIRouter, Depends, Path
 
 from app.api.dependencies import get_analysis_service
-from app.schemas.analysis import AnalysisResponse
+from app.schemas.analysis import AnalysisResponse, AnalysisStatusResponse
 from app.services.analysis_service import AnalysisService
 
 router = APIRouter(prefix="/projects", tags=["analysis"])
@@ -40,3 +41,21 @@ def analyze(
     both steps succeeded; otherwise an error is returned.
     """
     return AnalysisResponse.from_result(project_id, service.analyze(project_id))
+
+
+@router.get(
+    "/{project_id}/analysis",
+    response_model=AnalysisStatusResponse,
+    summary="Get the analysis state of a project",
+    responses={404: ERRORS[404]},  # type: ignore[dict-item]
+)
+def get_analysis(
+    project_id: str = Path(description="ID returned when the project was imported"),
+    service: AnalysisService = Depends(get_analysis_service),
+) -> AnalysisStatusResponse:
+    """Whether the project is ready for chat, with the report of its last successful analysis.
+
+    Read from the project's workspace: no database is queried, nothing is recomputed.
+    `not_analyzed` also covers an analysis that failed or was interrupted.
+    """
+    return AnalysisStatusResponse.from_result(project_id, service.get_analysis(project_id))

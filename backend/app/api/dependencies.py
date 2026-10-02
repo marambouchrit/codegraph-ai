@@ -27,6 +27,7 @@ from app.services.chat_service import ChatService
 from app.services.graph_retrieval_service import GraphRetrievalService
 from app.services.graph_service import GraphService
 from app.services.graphrag_service import GraphRAGService
+from app.services.project_graph_service import ProjectGraphService
 from app.services.project_service import ProjectService
 from app.services.vector_index_service import VectorIndexService
 from app.services.vector_retrieval_service import VectorRetrievalService
@@ -83,6 +84,19 @@ def get_analysis_service(
 
     # Factories, as for the chat: nothing is connected before the project is found.
     return AnalysisService(project_service, graph, vectors)
+
+
+def get_project_graph_service(
+    project_service: ProjectService = Depends(get_project_service),
+) -> ProjectGraphService:
+    settings = get_settings()
+
+    def retrieval() -> GraphRetrievalService:
+        neo4j, _ = _database_clients()
+        return GraphRetrievalService(GraphRepository(neo4j, settings.graph_batch_size))
+
+    # A factory, as for the chat: nothing is connected before the project is found.
+    return ProjectGraphService(project_service, retrieval)
 
 
 def close_chat_resources() -> None:

@@ -95,6 +95,10 @@ class FakeNeo4j:
             return [{"entity": dict(node.properties)}] if node is not None else []
         if query == queries.FIND_ENTITIES:
             return self._find_entities(parameters)
+        if query == queries.PROJECT_GRAPH_NODES:
+            return self._project_graph_nodes(parameters)
+        if query == queries.PROJECT_GRAPH_EDGES:
+            return self._project_graph_edges(parameters)
         if match := _REACHABLE.search(query):
             direction = _direction(match.group(1), match.group(4))
             types, depth = match.group(2).split("|"), int(match.group(3))
@@ -203,6 +207,30 @@ class FakeNeo4j:
     def _type_allowed(self, node_id: str, parameters: dict[str, Any]) -> bool:
         allowed = parameters["entity_types"]
         return allowed is None or self.nodes[node_id].properties["entity_type"] in allowed
+
+    def _project_graph_nodes(self, parameters: dict[str, Any]) -> list[Row]:
+        rank = {"file": 0, "class": 1, "interface": 1, "function": 2}
+
+        def order(node: StoredNode) -> tuple[Any, ...]:
+            p = node.properties
+            return rank.get(p["entity_type"], 3), p["file_path"], p["start_line"], p["id"]
+
+        nodes = [n for i, n in self.nodes.items() if self._in_project(i, parameters)]
+        return [{"entity": dict(n.properties)} for n in sorted(nodes, key=order)][: parameters["limit"]]
+
+    def _project_graph_edges(self, parameters: dict[str, Any]) -> list[Row]:
+        ids, types = set(parameters["ids"]), set(parameters["types"])
+        edges = [
+            r for r in self.relationships.values()
+            if self._in_project(r.source_id, parameters) and self._in_project(r.target_id, parameters)
+            and r.source_id in ids and r.target_id in ids and r.type in types
+        ]  # fmt: skip
+        edges.sort(key=lambda r: (r.type, r.source_id, r.target_id, r.properties["id"]))
+        return [
+            {"type": r.type, "relationship": dict(r.properties),
+             "source_id": r.source_id, "target_id": r.target_id}
+            for r in edges[: parameters["limit"]]
+        ]  # fmt: skip
 
     def _find_entities(self, parameters: dict[str, Any]) -> list[Row]:
         text = parameters["text"]

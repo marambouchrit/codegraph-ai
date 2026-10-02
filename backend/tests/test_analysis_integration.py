@@ -46,6 +46,7 @@ class Servers:
         self.repository = repository
         self.store = store
         self.project_ids: list[str] = []
+        self.embedding_model = ""
 
 
 @pytest.fixture
@@ -72,6 +73,7 @@ def servers(settings: Settings) -> Iterator[Servers]:
             projects, lambda: graphrag, lambda: generator
         )
         servers = Servers(TestClient(app), repository, store)
+        servers.embedding_model = embeddings.model_name
         try:
             yield servers
         finally:
@@ -99,7 +101,7 @@ def test_import_analyze_and_chat_over_http(servers: Servers, make_zip: MakeZip) 
     assert report["status"] == "ready" and report["failed_files"] == 0
     assert report["graph"]["entities"] > 0 and report["graph"]["relationships"] > 0
     assert report["vectors"]["chunks"] == servers.store.count(project_id) > 0
-    assert report["vectors"]["embedding_model"] == "BAAI/bge-m3"
+    assert report["vectors"]["embedding_model"] == servers.embedding_model  # EMBEDDING_MODEL
     assert servers.repository.project_exists(project_id)
 
     # Analyzing again changes nothing: no duplicate nodes or points.

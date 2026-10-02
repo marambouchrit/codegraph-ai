@@ -149,6 +149,19 @@ class RelationshipResult:
 
 
 @dataclass(frozen=True)
+class ProjectGraph:
+    """A bounded view of one project's graph: some nodes and the edges between them."""
+
+    project_id: str
+    nodes: tuple[EntityResult, ...]
+    edges: tuple[RelationshipResult, ...]  # both ends are in `nodes`
+    nodes_truncated: bool  # the project has more nodes than returned
+    edges_truncated: bool  # the returned nodes have more edges between them than returned
+    total_nodes: int  # in the whole project graph
+    total_edges: int
+
+
+@dataclass(frozen=True)
 class RelatedEntity:
     """An entity reached from the entity asked about, and how it was reached.
 

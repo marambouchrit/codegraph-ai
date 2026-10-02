@@ -39,6 +39,12 @@ class ContentTooLargeError(AppError):
     status_code = 413
 
 
+class AnalysisInProgressError(AppError):
+    """The project is already being analyzed; a second run at the same time is refused."""
+
+    status_code = 409
+
+
 class NoSourceFilesError(AppError):
     status_code = 422
 

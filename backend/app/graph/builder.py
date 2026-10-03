@@ -12,12 +12,20 @@ Re-building a project replaces its previous graph without ever deleting it first
 every node and relationship written by a build is stamped with that build's ID,
 and once everything is written, the project's nodes and relationships with another
 build ID (code deleted since the last analysis) are removed.
+
+An incremental update (Phase 14) writes less: `diff_graph()` compares the nodes and
+relationships of the new analysis with the fingerprints saved by the previous one, and
+`apply()` writes only what differs and deletes only what disappeared.
 """
 
 import logging
 import time
 import uuid
 from collections import Counter
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+
+from app.analysis.index import fingerprint
 
 from app.extraction.models import Entity
 from app.graph.models import GraphBuildReport, GraphEdge, GraphNode
@@ -102,6 +110,63 @@ def graph_edges(report: RelationshipReport) -> list[GraphEdge]:
     return valid
 
 
+def node_fingerprint(node: GraphNode) -> str:
+    return fingerprint([node.label, node.properties])
+
+
+def edge_fingerprint(edge: GraphEdge) -> str:
+    return fingerprint([edge.type, edge.source_id, edge.target_id, edge.properties])
+
+
+@dataclass(frozen=True)
+class GraphDiff:
+    """What an incremental update must do to turn the previous graph into the new one."""
+
+    nodes_to_write: tuple[GraphNode, ...]  # new, or with changed properties (lines moved...)
+    edges_to_write: tuple[GraphEdge, ...]
+    nodes_to_delete: tuple[str, ...]  # IDs
+    edges_to_delete: tuple[tuple[str, str], ...]  # (relationship ID, source node ID)
+
+
+def diff_graph(
+    nodes: Sequence[GraphNode],
+    edges: Sequence[GraphEdge],
+    previous_nodes: Mapping[str, str],
+    previous_edges: Mapping[str, tuple[str, str]],
+) -> GraphDiff:
+    """Compare the new graph with the previous one.
+
+    `previous_nodes` maps node IDs to fingerprints; `previous_edges` maps relationship
+    IDs to (fingerprint, source node ID). Cross-file relationships need nothing special:
+    a relationship that is no longer resolved (its target was deleted) is simply absent
+    from `edges`, so it is deleted; a newly resolved one is written.
+    """
+    node_ids = {node.id for node in nodes}
+    edge_ids = {edge.id for edge in edges}
+    return GraphDiff(
+        nodes_to_write=tuple(
+            node for node in nodes if previous_nodes.get(node.id) != node_fingerprint(node)
+        ),
+        edges_to_write=tuple(
+            edge for edge in edges
+            if previous_edges.get(edge.id, ("", ""))[0] != edge_fingerprint(edge)
+        ),  # fmt: skip
+        nodes_to_delete=tuple(sorted(i for i in previous_nodes if i not in node_ids)),
+        edges_to_delete=tuple(
+            sorted((edge_id, source) for edge_id, (_, source) in previous_edges.items()
+                   if edge_id not in edge_ids)
+        ),  # fmt: skip
+    )
+
+
+@dataclass(frozen=True)
+class GraphUpdateReport:
+    nodes_written: int
+    relationships_written: int
+    nodes_deleted: int
+    relationships_deleted: int
+
+
 class GraphBuilder:
     def __init__(self, repository: GraphRepository) -> None:
         self.repository = repository
@@ -137,3 +202,27 @@ class GraphBuilder:
         )
         logger.info("Project %s: %s", project_id, result.summary)
         return result
+
+    def apply(
+        self, project_id: str, diff: GraphDiff, build_id: str | None = None
+    ) -> GraphUpdateReport:
+        """Write an incremental update: new and changed first, then remove what disappeared.
+
+        Untouched nodes and relationships are not sent to Neo4j at all. Writing before
+        deleting keeps the rule of `build()`: if a batch fails, nothing was deleted yet.
+        """
+        build_id = build_id or uuid.uuid4().hex
+        self.repository.ensure_schema()
+        nodes_written = self.repository.upsert_nodes(diff.nodes_to_write, build_id)
+        relationships_written = self.repository.upsert_relationships(
+            project_id, diff.edges_to_write, build_id
+        )
+        # Relationships first: deleting a node also deletes its relationships, which
+        # would then no longer be found (and counted).
+        relationships_deleted = self.repository.delete_relationships(
+            project_id, diff.edges_to_delete
+        )
+        nodes_deleted = self.repository.delete_nodes(project_id, diff.nodes_to_delete)
+        return GraphUpdateReport(
+            nodes_written, relationships_written, nodes_deleted, relationships_deleted
+        )

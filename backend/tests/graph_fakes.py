@@ -83,6 +83,10 @@ class FakeNeo4j:
             return self._delete_relationships(parameters)
         if query in (queries.DELETE_STALE_NODES, queries.DELETE_PROJECT_NODES):
             return self._delete_nodes(query, parameters)
+        if query == queries.DELETE_NODES_BY_ID:
+            return self._delete_nodes_by_id(parameters)
+        if query == queries.DELETE_RELATIONSHIPS_BY_ID:
+            return self._delete_relationships_by_id(parameters)
         if query == queries.PROJECT_EXISTS:
             ids = [node_id for node_id in self.nodes if self._in_project(node_id, parameters)]
             return [{"id": ids[0]}] if ids else []
@@ -179,6 +183,27 @@ class FakeNeo4j:
             for key in [k for k in self.relationships if node_id in (k[0], k[3])]:
                 del self.relationships[key]
         return [{"count": len(doomed)}]
+
+    def _delete_nodes_by_id(self, parameters: dict[str, Any]) -> list[Row]:
+        ids = [i for i in parameters["ids"] if self._in_project(i, parameters)]
+        for node_id in ids:
+            del self.nodes[node_id]
+        gone = set(ids)
+        for key in [k for k, r in self.relationships.items()
+                    if r.source_id in gone or r.target_id in gone]:  # DETACH
+            del self.relationships[key]
+        return [{"count": len(ids)}]
+
+    def _delete_relationships_by_id(self, parameters: dict[str, Any]) -> list[Row]:
+        count = 0
+        for row in parameters["rows"]:
+            if not self._in_project(row["source_id"], parameters):
+                continue
+            for key in [k for k, r in self.relationships.items()
+                        if r.source_id == row["source_id"] and r.properties.get("id") == row["id"]]:
+                del self.relationships[key]
+                count += 1
+        return [{"count": count}]
 
     def _count_nodes(self, parameters: dict[str, Any]) -> list[Row]:
         counts: dict[str, int] = {}

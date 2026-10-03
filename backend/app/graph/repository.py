@@ -119,6 +119,23 @@ DETACH DELETE n
 RETURN count(n) AS count
 """
 
+# Incremental updates (Phase 14): remove exactly the nodes and relationships that no
+# longer exist in the code, found by ID (through the unique-ID index) inside one project.
+DELETE_NODES_BY_ID = f"""
+UNWIND $ids AS id
+MATCH (n:{ENTITY_LABEL} {{id: id, project_id: $project_id}})
+DETACH DELETE n
+RETURN count(n) AS count
+"""
+
+DELETE_RELATIONSHIPS_BY_ID = f"""
+UNWIND $rows AS row
+MATCH (:{ENTITY_LABEL} {{id: row.source_id, project_id: $project_id}})-[r]->()
+WHERE r.id = row.id
+DELETE r
+RETURN count(r) AS count
+"""
+
 PROJECT_EXISTS = f"""
 MATCH (n:{ENTITY_LABEL} {{project_id: $project_id}})
 RETURN n.id AS id
@@ -319,6 +336,25 @@ class GraphRepository:
         relationships = self._delete_in_batches(DELETE_STALE_RELATIONSHIPS, parameters)
         nodes = self._delete_in_batches(DELETE_STALE_NODES, parameters)
         return nodes, relationships
+
+    def delete_nodes(self, project_id: str, node_ids: Sequence[str]) -> int:
+        """Delete these nodes of the project, with their relationships. Returns the count."""
+        deleted = 0
+        for batch in _batches(list(node_ids), self.batch_size):
+            deleted += self._write_count(
+                DELETE_NODES_BY_ID, {"project_id": project_id, "ids": list(batch)}
+            )
+        return deleted
+
+    def delete_relationships(self, project_id: str, edges: Sequence[tuple[str, str]]) -> int:
+        """Delete relationships given as (relationship ID, source node ID). Returns the count."""
+        deleted = 0
+        for batch in _batches(list(edges), self.batch_size):
+            rows = [{"id": edge_id, "source_id": source_id} for edge_id, source_id in batch]
+            deleted += self._write_count(
+                DELETE_RELATIONSHIPS_BY_ID, {"project_id": project_id, "rows": rows}
+            )
+        return deleted
 
     def delete_project(self, project_id: str) -> int:
         """Delete the nodes (and their relationships) of one project only. Returns the count."""

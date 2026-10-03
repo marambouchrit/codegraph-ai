@@ -33,12 +33,15 @@ from app.graph.models import (
     EntityResult,
     GraphContext,
     GraphPath,
+    ImpactedEntity,
+    ImpactResult,
     ProjectGraph,
     RelatedEntity,
 )
 from app.graph.repository import MAX_TRAVERSAL_DEPTH, GraphRepository
 from app.graph.schema import CONTAINS, RELATIONSHIP_TYPES
 from app.ingestion.workspace import is_valid_project_id
+from app.relationships.models import RelationshipType
 
 DEFAULT_LIMIT = 50  # entities returned by one question
 MAX_LIMIT = 200
@@ -51,6 +54,14 @@ MAX_ID_LENGTH = 4096  # entity IDs contain a file path and a qualified name
 DEFAULT_GRAPH_NODES = 150  # whole-project graph for display: readable in a browser
 MAX_GRAPH_NODES = 500
 MAX_GRAPH_EDGES = 2000  # between the returned nodes
+# Whole-project analyses (dependencies, architecture) read more than a display needs,
+# but still a bounded amount: a larger project is analyzed partially, and says so.
+ANALYSIS_GRAPH_NODES = 5000
+ANALYSIS_GRAPH_EDGES = 20000
+# "Who references this?": every relationship that makes its source depend on its target.
+IMPACT_TYPES = tuple(sorted(relationship_type.value for relationship_type in RelationshipType))
+DEFAULT_IMPACT_DEPTH = 3
+MAX_IMPACT_ENTITIES = 300
 
 
 class GraphRetrievalService:
@@ -73,6 +84,72 @@ class GraphRetrievalService:
             _project(project_id),
             node_limit=_limit(limit, MAX_GRAPH_NODES),
             edge_limit=MAX_GRAPH_EDGES,
+        )
+
+    def get_analysis_graph(self, project_id: str) -> ProjectGraph:
+        """The project's graph for whole-project analyses: same query, larger bounds."""
+        return self.repository.get_project_graph(
+            _project(project_id),
+            node_limit=ANALYSIS_GRAPH_NODES,
+            edge_limit=ANALYSIS_GRAPH_EDGES,
+        )
+
+    # ----- Impact -----
+
+    def get_impact(
+        self,
+        project_id: str,
+        entity_id: str,
+        *,
+        max_depth: int = DEFAULT_IMPACT_DEPTH,
+        limit: int = MAX_IMPACT_ENTITIES,
+    ) -> ImpactResult:
+        """What may be affected if an entity changes: who references it, and who
+        references those, up to `max_depth` steps away.
+
+        A breadth-first walk over incoming CALLS, USES, INHERITS, IMPLEMENTS, IMPORTS
+        and DEPENDS_ON relationships. It starts from the entity and from everything it
+        defines (changing a class changes its methods). Each affected entity is
+        returned once, at its smallest distance, with the relationship that reaches
+        it. Bounded by `max_depth` and `limit`: `truncated` says when more exist.
+        """
+        depth, limit = _depth(max_depth), _limit(limit, MAX_IMPACT_ENTITIES)
+        entity = self.get_entity(project_id, entity_id)
+        contained = [
+            related.entity
+            for related in self.repository.get_contained_entities(
+                project_id, entity.id, limit=MAX_LIMIT, max_depth=MAX_TRAVERSAL_DEPTH
+            )
+        ]
+        seen = {entity.id, *(item.id for item in contained)}
+        frontier = [entity, *contained]
+        affected: list[ImpactedEntity] = []
+        truncated = False
+        for distance in range(1, depth + 1):
+            next_frontier: list[EntityResult] = []
+            for target in frontier:
+                for related in self.repository.get_related(
+                    project_id, target.id, IMPACT_TYPES, Direction.INCOMING, limit=MAX_LIMIT
+                ):
+                    if related.entity.id in seen or related.relationship is None:
+                        continue
+                    if len(affected) >= limit:
+                        truncated = True
+                        break
+                    seen.add(related.entity.id)
+                    affected.append(ImpactedEntity(related.entity, distance, related.relationship))
+                    next_frontier.append(related.entity)
+                if truncated:
+                    break
+            if truncated or not next_frontier:
+                break
+            frontier = next_frontier
+        return ImpactResult(
+            entity=entity,
+            contained=tuple(contained),
+            affected=tuple(affected),
+            max_depth=depth,
+            truncated=truncated,
         )
 
     # ----- Entities -----

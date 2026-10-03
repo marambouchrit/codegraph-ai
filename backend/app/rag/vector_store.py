@@ -200,6 +200,41 @@ class QdrantVectorStore:
         stale = _filter(project_id, exclude_index_id=index_id)
         return self._delete(stale)
 
+    def update_payloads(
+        self, chunks: Sequence[CodeChunk], *, index_id: str, embedding_model: str
+    ) -> int:
+        """Replace the metadata of existing points, keeping their vectors. Returns the count.
+
+        For chunks whose embedded text did not change but whose metadata did (the code
+        moved to other lines): no new embedding is needed.
+        """
+        with self.qdrant_errors():
+            for chunk in chunks:
+                self.client.overwrite_payload(
+                    self.collection,
+                    payload={
+                        **chunk.to_payload(),
+                        "embedding_model": embedding_model,
+                        "index_id": index_id,
+                    },
+                    points=[point_id(chunk.id, embedding_model)],
+                    wait=True,
+                )
+        return len(chunks)
+
+    def delete_chunks(
+        self, project_id: str, chunk_ids: Sequence[str], embedding_model: str
+    ) -> int:
+        """Delete the points of these chunks, inside one project only. Returns the count."""
+        if not chunk_ids:
+            return 0
+        selected = _filter(project_id)
+        selected.must = [
+            *(selected.must or []),  # type: ignore[misc]
+            models.HasIdCondition(has_id=[point_id(c, embedding_model) for c in chunk_ids]),
+        ]
+        return self._delete(selected)
+
     def delete_project(self, project_id: str) -> int:
         """Delete every point of one project (other projects are untouched)."""
         return self._delete(_filter(project_id))

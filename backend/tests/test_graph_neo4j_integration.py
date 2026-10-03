@@ -16,7 +16,14 @@ import pytest
 
 from app.core.config import Settings
 from app.core.errors import EntityNotFoundError
-from app.graph.builder import GraphBuilder
+from app.graph.builder import (
+    GraphBuilder,
+    diff_graph,
+    edge_fingerprint,
+    graph_edges,
+    graph_nodes,
+    node_fingerprint,
+)
 from app.graph.client import Neo4jClient
 from app.graph.repository import GraphRepository
 from app.services.graph_retrieval_service import GraphRetrievalService
@@ -146,3 +153,50 @@ def test_retrieval_is_isolated_on_a_real_server(
     assert callers and {c.entity.project_id for c in callers} == {project_a}
     with pytest.raises(EntityNotFoundError):
         service.get_callers(project_a, full(project_b, SAVE))
+
+
+def test_an_incremental_update_gives_the_same_graph_as_the_fake(
+    repository: GraphRepository, project_ids: list[str]
+) -> None:
+    """Phase 14: write a difference (changed nodes, removed nodes and relationships) to a
+    real Neo4j and to the fake; both end with the same graph, and the neighbour project
+    is untouched."""
+    project_a, project_b = project_ids
+    database = FakeNeo4j()
+    fake_repository = GraphRepository(
+        Neo4jClient("bolt://localhost:7687", "neo4j", "", "neo4j",
+                    driver_factory=fake_driver_factory(database))
+    )  # fmt: skip
+    before = analyze(FILES, project_a)
+    for target in (repository, fake_repository):
+        GraphBuilder(target).build(before)
+    GraphBuilder(repository).build(analyze(FILES, project_b))
+    neighbour = repository.statistics(project_b)
+
+    # auth.py no longer calls User.save, and gains a function; user.py loses `save`.
+    after = analyze({
+        "src/models/user.py": "class User:\n    pass\n",
+        "src/services/auth.py": (
+            "from models.user import User\n\ndef login():\n    return User()\n\n"
+            "def logout():\n    return None\n"
+        ),
+    }, project_a)  # fmt: skip
+    old_nodes, old_edges = graph_nodes(before), graph_edges(before)
+    diff = diff_graph(
+        graph_nodes(after), graph_edges(after),
+        {node.id: node_fingerprint(node) for node in old_nodes},
+        {edge.id: (edge_fingerprint(edge), edge.source_id) for edge in old_edges},
+    )  # fmt: skip
+    assert diff.nodes_to_delete and diff.edges_to_delete and diff.nodes_to_write
+
+    real = GraphBuilder(repository).apply(project_a, diff)
+    fake = GraphBuilder(fake_repository).apply(project_a, diff)
+
+    assert real == fake
+    assert real.nodes_deleted == len(diff.nodes_to_delete)
+    assert repository.statistics(project_a) == fake_repository.statistics(project_a)
+    retrieval, fake_retrieval = GraphRetrievalService(repository), GraphRetrievalService(fake_repository)
+    assert retrieval.get_project_graph(project_a) == fake_retrieval.get_project_graph(project_a)
+    # Exactly the graph a full build of the new code gives.
+    assert sum(repository.statistics(project_a).nodes_by_label.values()) == len(graph_nodes(after))
+    assert repository.statistics(project_b) == neighbour  # the other project is untouched

@@ -162,6 +162,27 @@ class ProjectGraph:
 
 
 @dataclass(frozen=True)
+class ImpactedEntity:
+    """An entity that may be affected by a change, and how the change reaches it."""
+
+    entity: EntityResult
+    depth: int  # 1: it references the changed entity directly; 2: it references a depth-1...
+    # The relationship that makes it affected: from this entity to one closer to the change.
+    relationship: RelationshipResult
+
+
+@dataclass(frozen=True)
+class ImpactResult:
+    """Who may be affected if `entity` changes (reverse references, bounded)."""
+
+    entity: EntityResult
+    contained: tuple[EntityResult, ...]  # what the entity defines: changes with it
+    affected: tuple[ImpactedEntity, ...]  # closest first, each entity once
+    max_depth: int
+    truncated: bool  # more entities are affected than returned
+
+
+@dataclass(frozen=True)
 class RelatedEntity:
     """An entity reached from the entity asked about, and how it was reached.
 

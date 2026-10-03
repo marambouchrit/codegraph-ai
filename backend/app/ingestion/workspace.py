@@ -4,7 +4,8 @@ Layout:
     <workspace_dir>/
         <project_id>/
             project.json   <- project metadata, written only when ingestion succeeds
-            analysis.json  <- report of the last successful analysis (absent: not analyzed)
+            analysis.json  <- analysis state: current job, progress, last successful report
+            analysis_index.json  <- file hashes and per-file results, for incremental analysis
             source/        <- the repository files
 """
 
@@ -48,6 +49,9 @@ class Workspace:
 
     def analysis_file(self, project_id: str) -> Path:
         return self.project_dir(project_id) / "analysis.json"
+
+    def analysis_index_file(self, project_id: str) -> Path:
+        return self.project_dir(project_id) / "analysis_index.json"
 
     def create_project_dir(self, project_id: str) -> Path:
         path = self.project_dir(project_id)

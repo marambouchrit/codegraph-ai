@@ -28,7 +28,7 @@ Usage (the store owns the Qdrant connection, so close it when done):
 import logging
 import time
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import TypeVar
 
 from app.core.config import Settings
@@ -43,8 +43,8 @@ from app.extraction.service import EntityExtractionService
 from app.parsing.base import ParseResult
 from app.parsing.service import ParserService
 from app.rag.chunker import CodeChunker
-from app.rag.embeddings import EmbeddingProvider
-from app.rag.models import ChunkingResult, VectorIndexReport
+from app.rag.embeddings import EmbeddingProvider, Vector
+from app.rag.models import ChunkingResult, CodeChunk, VectorIndexReport
 from app.rag.vector_store import QdrantVectorStore
 from app.services.project_service import ProjectService
 
@@ -92,14 +92,52 @@ class VectorIndexService:
         )
         return result, extraction
 
+    # ----- Building blocks, also used by the incremental analysis (Phase 14) -----
+
+    def prepare(self) -> int:
+        """Fail fast: Qdrant down, model missing, wrong collection. Returns the dimension."""
+        self.vector_store.verify_connectivity()
+        dimension = self.embeddings.dimension  # loads the model once
+        self.vector_store.ensure_collection(dimension)
+        return dimension
+
+    def embed(
+        self,
+        chunks: Sequence[CodeChunk],
+        on_progress: Callable[[int], None] | None = None,
+    ) -> list[Vector]:
+        """One vector per chunk, computed in batches. Nothing is written to Qdrant.
+
+        `on_progress` is called after each batch with the number of chunks embedded so far.
+        """
+        vectors: list[Vector] = []
+        for batch in _batches(chunks, self.batch_size):
+            vectors.extend(self.embeddings.embed_documents([c.embedding_text for c in batch]))
+            if on_progress is not None:
+                on_progress(len(vectors))
+        return vectors
+
+    def store(
+        self, chunks: Sequence[CodeChunk], vectors: Sequence[Vector], index_id: str
+    ) -> int:
+        """Write already-embedded chunks to Qdrant, in batches. Returns the count."""
+        written = 0
+        model = self.embeddings.model_name
+        for start in range(0, len(chunks), self.batch_size):
+            end = start + self.batch_size
+            written += self.vector_store.upsert(
+                chunks[start:end], vectors[start:end], index_id=index_id, embedding_model=model
+            )
+        return written
+
+    # ----- Whole project -----
+
     def index_project(self, project_id: str) -> VectorIndexReport:
         """Chunk, embed and store the project in Qdrant (idempotent). Returns a report."""
         started = time.perf_counter()
         self.project_service.get_project(project_id)  # unknown project: fail before anything
         # Fail fast, before the analysis: Qdrant down, model missing, wrong collection.
-        self.vector_store.verify_connectivity()
-        dimension = self.embeddings.dimension  # loads the model once
-        self.vector_store.ensure_collection(dimension)
+        dimension = self.prepare()
 
         chunking, extraction = self.chunk_project(project_id)
         index_id = uuid.uuid4().hex

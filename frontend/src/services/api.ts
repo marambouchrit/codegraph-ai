@@ -1,12 +1,14 @@
 // All HTTP calls to the FastAPI backend. Components never call fetch themselves.
 
 import type {
-  AnalysisResponse,
   AnalysisStatus,
+  ArchitectureOverview,
   ChatRequest,
   ChatResponse,
+  DependencyAnalysis,
   GitHubProjectCreate,
   HealthResponse,
+  ImpactAnalysis,
   Project,
   ProjectGraph,
 } from '../types/api'
@@ -111,14 +113,19 @@ export function uploadProjectZip(file: File): Promise<Project> {
   return request<Project>('/projects/zip', { method: 'POST', body: form })
 }
 
-/** Build the knowledge graph and the vector index. Synchronous: can take minutes. */
-export function analyzeProject(projectId: string): Promise<AnalysisResponse> {
-  return request<AnalysisResponse>(`/projects/${encodeURIComponent(projectId)}/analyze`, {
+/**
+ * Start analyzing a project. Returns at once (202) with a queued job: the analysis runs
+ * in the background on the server; follow it with getAnalysis().
+ * `full` forces everything to be analyzed again instead of only what changed.
+ */
+export function analyzeProject(projectId: string, full = false): Promise<AnalysisStatus> {
+  const query = full ? '?full=true' : ''
+  return request<AnalysisStatus>(`/projects/${encodeURIComponent(projectId)}/analyze${query}`, {
     method: 'POST',
   })
 }
 
-/** The persisted analysis state: is the project ready, and its last report. */
+/** The analysis state: status, the current or last job with real progress, the last report. */
 export function getAnalysis(projectId: string): Promise<AnalysisStatus> {
   return request<AnalysisStatus>(`/projects/${encodeURIComponent(projectId)}/analysis`)
 }
@@ -127,6 +134,23 @@ export function getAnalysis(projectId: string): Promise<AnalysisStatus> {
 export function getGraph(projectId: string, limit?: number): Promise<ProjectGraph> {
   const query = limit === undefined ? '' : `?limit=${encodeURIComponent(limit)}`
   return request<ProjectGraph>(`/projects/${encodeURIComponent(projectId)}/graph${query}`)
+}
+
+/** What may be affected if an entity changes (reverse references, up to `depth` steps). */
+export function getImpact(projectId: string, entityId: string, depth?: number): Promise<ImpactAnalysis> {
+  const query = new URLSearchParams({ entity_id: entityId })
+  if (depth !== undefined) query.set('depth', String(depth))
+  return request<ImpactAnalysis>(`/projects/${encodeURIComponent(projectId)}/analysis/impact?${query}`)
+}
+
+/** File dependencies, circular dependencies, hubs and unreferenced entities (no LLM). */
+export function getDependencies(projectId: string): Promise<DependencyAnalysis> {
+  return request<DependencyAnalysis>(`/projects/${encodeURIComponent(projectId)}/analysis/dependencies`)
+}
+
+/** Architecture facts computed from the graph, and an LLM summary of them (one LLM call). */
+export function getArchitecture(projectId: string): Promise<ArchitectureOverview> {
+  return request<ArchitectureOverview>(`/projects/${encodeURIComponent(projectId)}/analysis/architecture`)
 }
 
 export function askQuestion(projectId: string, question: string): Promise<ChatResponse> {

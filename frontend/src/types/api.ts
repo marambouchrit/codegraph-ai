@@ -46,22 +46,62 @@ export interface VectorSummary {
   stale_chunks_removed: number
 }
 
+// What one analysis really processed (a full analysis processes everything).
+export interface AnalysisChanges {
+  files_added: number
+  files_modified: number
+  files_unchanged: number
+  files_deleted: number
+  files_parsed: number
+  nodes_written: number
+  nodes_deleted: number
+  relationships_written: number
+  relationships_deleted: number
+  chunks_embedded: number // embeddings generated
+  chunks_reused: number // existing vectors kept
+  chunks_updated: number // kept vectors whose metadata (lines) was refreshed
+  chunks_deleted: number
+}
+
 export interface AnalysisResponse {
   project_id: string
-  status: 'ready' // a failed analysis is an HTTP error, never a response
+  status: 'ready' // this report describes a finished analysis
+  mode: 'full' | 'incremental'
   graph: GraphSummary
   vectors: VectorSummary
+  changes: AnalysisChanges
   failed_files: number
   warnings: string[]
   duration_seconds: number
   analyzed_at: string // ISO 8601 datetime (UTC)
 }
 
-// GET /projects/{id}/analysis: the last successful analysis, persisted by the backend.
-// not_analyzed also covers an analysis that failed or was interrupted.
+export type AnalysisPhase =
+  | 'preparing' | 'detecting_changes' | 'parsing' | 'resolving'
+  | 'embedding' | 'graph' | 'vector_index' | 'finalizing' // prettier-ignore
+
+// The latest analysis job of a project (it runs in the background on the server).
+export interface AnalysisJob {
+  job_id: string
+  status: 'queued' | 'running' | 'ready' | 'failed'
+  mode: 'full' | 'incremental' | null // known once the changes are detected
+  phase: AnalysisPhase | null
+  completed: number | null // real count of the current phase; null when nothing is countable
+  total: number | null
+  unit: 'files' | 'chunks' | null
+  queued_at: string
+  started_at: string | null
+  finished_at: string | null
+  error: string | null // safe to display
+}
+
+// POST /projects/{id}/analyze (202) and GET /projects/{id}/analysis.
+// `analysis` is the report whose data is in the databases: it stays set while a new job
+// runs and after a job that failed before writing anything; null otherwise.
 export interface AnalysisStatus {
   project_id: string
-  status: 'not_analyzed' | 'ready'
+  status: 'not_analyzed' | 'queued' | 'running' | 'ready' | 'failed'
+  job: AnalysisJob | null
   analysis: AnalysisResponse | null
 }
 
@@ -95,6 +135,79 @@ export interface ProjectGraph {
   truncated: boolean // the project has more nodes or edges than returned
   total_nodes: number
   total_edges: number
+}
+
+// ----- Advanced analysis (schemas/insights.py) -----
+
+export const DEFAULT_IMPACT_DEPTH = 3 // GET /analysis/impact?depth= default
+export const MAX_IMPACT_DEPTH = 5 // and maximum
+
+export interface ImpactedEntity {
+  entity: GraphNode
+  depth: number // 1: references the changed entity directly; 2: one step further...
+  relationship_type: string // how it depends on `via`
+  via: string // ID of the entity it references, one step closer to the change
+}
+
+export interface ImpactAnalysis {
+  project_id: string
+  entity: GraphNode
+  contained: number // entities it defines, which change with it
+  max_depth: number
+  affected: ImpactedEntity[] // closest first, each entity once
+  total: number
+  by_depth: Record<string, number>
+  truncated: boolean
+}
+
+export interface FileDependency {
+  source: string // file path
+  target: string
+  source_id: string
+  target_id: string
+  types: string[] // IMPORTS, DEPENDS_ON or both
+}
+
+export interface DependencyCycle {
+  files: string[] // [A, B, C] means A -> B -> C -> A
+  entity_ids: string[]
+}
+
+export interface Hub {
+  entity: GraphNode
+  incoming: number // distinct files or entities that depend on it
+}
+
+export interface DependencyAnalysis {
+  project_id: string
+  files: number
+  dependency_count: number
+  dependencies: FileDependency[]
+  dependencies_truncated: boolean
+  cycles: DependencyCycle[]
+  cycles_truncated: boolean
+  file_hubs: Hub[]
+  entity_hubs: Hub[]
+  unreferenced_count: number
+  unreferenced: GraphNode[] // no detected reference: NOT proof of dead code
+  unreferenced_note: string
+  files_without_dependents: GraphNode[]
+  partial: boolean
+}
+
+export interface ArchitectureFact {
+  number: number // the summary cites it as [number]
+  text: string
+  entities: GraphNode[]
+}
+
+export interface ArchitectureOverview {
+  project_id: string
+  facts: ArchitectureFact[] // computed from the knowledge graph
+  summary: string | null // Markdown by the LLM, from the facts only
+  cited: number[]
+  model: string | null
+  warnings: string[]
 }
 
 // ----- Chat (schemas/chat.py) -----

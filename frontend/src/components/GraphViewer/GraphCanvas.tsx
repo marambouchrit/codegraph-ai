@@ -7,6 +7,9 @@ interface Props {
   graph: ProjectGraph
   hiddenRelationships: ReadonlySet<string>
   selectedId: string | null
+  // IDs of the entities affected by a change of the selected node (impact analysis),
+  // or null when no impact analysis is shown.
+  impacted: ReadonlySet<string> | null
   onSelect: (nodeId: string | null) => void
 }
 
@@ -16,7 +19,7 @@ interface Props {
  * pages don't download it. This component owns the Cytoscape instance; React owns
  * the data (graph, selection, filters) and passes it down.
  */
-export default function GraphCanvas({ graph, hiddenRelationships, selectedId, onSelect }: Props) {
+export default function GraphCanvas({ graph, hiddenRelationships, selectedId, impacted, onSelect }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const cyRef = useRef<Core | null>(null)
   const onSelectRef = useRef(onSelect)
@@ -76,23 +79,30 @@ export default function GraphCanvas({ graph, hiddenRelationships, selectedId, on
     })
   }, [hiddenRelationships, status])
 
-  // Highlight the selected node and its relationships; center it if it was chosen elsewhere.
+  // Highlight the selected node with its relationships, or with the entities its change
+  // would affect (impact analysis); center it if it was chosen outside the canvas.
   useEffect(() => {
     const cy = cyRef.current
     if (!cy) return
-    cy.elements().removeClass('faded highlighted').unselect()
+    cy.elements().removeClass('faded highlighted impacted').unselect()
     if (!selectedId) return
     const node = cy.getElementById(selectedId)
     if (node.empty()) return
     node.select()
-    const neighborhood = node.closedNeighborhood()
-    cy.elements().not(neighborhood).addClass('faded')
-    node.connectedEdges().addClass('highlighted')
+    if (impacted) {
+      const affected = cy.nodes().filter((other) => impacted.has(other.id()))
+      affected.addClass('impacted')
+      const shown = affected.union(node)
+      cy.elements().not(shown.union(shown.edgesWith(shown))).addClass('faded')
+    } else {
+      cy.elements().not(node.closedNeighborhood()).addClass('faded')
+      node.connectedEdges().addClass('highlighted')
+    }
     if (!tappedRef.current) {
       cy.animate({ center: { eles: node }, zoom: Math.max(cy.zoom(), 1) }, { duration: 300 })
     }
     tappedRef.current = false
-  }, [selectedId, status])
+  }, [selectedId, impacted, status])
 
   function zoomBy(factor: number) {
     const cy = cyRef.current

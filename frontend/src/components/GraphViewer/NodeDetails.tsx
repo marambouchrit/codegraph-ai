@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import type { GraphEdge, GraphNode, ProjectGraph } from '../../types/api'
 import { entityColor, ENTITY_STYLES, relationshipColor } from './graphStyle'
 
@@ -6,10 +7,11 @@ interface Props {
   nodeId: string
   onSelect: (nodeId: string) => void
   onClose: () => void
+  children?: ReactNode // extra sections about the node (impact analysis)
 }
 
 /** The selected node's metadata (as stored in Neo4j) and its relationships in the shown graph. */
-export default function NodeDetails({ graph, nodeId, onSelect, onClose }: Props) {
+export default function NodeDetails({ graph, nodeId, onSelect, onClose, children }: Props) {
   const byId = new Map(graph.nodes.map((node) => [node.id, node]))
   const node = byId.get(nodeId)
   if (!node) return null
@@ -50,6 +52,7 @@ export default function NodeDetails({ graph, nodeId, onSelect, onClose }: Props)
       {graph.truncated && (
         <p className="muted node-note">Only relationships within the displayed graph are listed.</p>
       )}
+      {children}
     </aside>
   )
 }

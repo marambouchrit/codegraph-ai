@@ -116,6 +116,7 @@
 .graph-canvas-wrap {
   position: relative;
   min-width: 0;
+  align-self: start; /* keep the controls on the canvas when the details panel is taller */
 }
 
 .graph-canvas {
@@ -252,4 +253,72 @@
 .node-note {
   margin: 10px 0 0;
   font-size: 0.8rem;
+}
+
+/* ----- Impact analysis ----- */
+
+.impact {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.impact h4 {
+  margin: 0 0 8px;
+  font-size: 0.9rem;
+}
+
+.impact h5 {
+  margin: 10px 0 4px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.impact p {
+  margin: 8px 0 0;
+}
+
+.impact-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.impact-controls .input {
+  width: auto;
+  padding: 4px 8px;
+}
+
+.impact-controls .button {
+  padding: 6px 10px;
+}
+
+.impact ul {
+  display: grid;
+  gap: 4px;
+  max-height: 260px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.impact li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  overflow-wrap: anywhere;
+}
+
+.impact-file {
+  font-size: 0.78rem;
+}
+
+.impact-legend .type-dot {
+  border: 3px solid;
+  background: transparent;
 }

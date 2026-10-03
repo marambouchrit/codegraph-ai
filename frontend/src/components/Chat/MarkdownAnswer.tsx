@@ -6,6 +6,7 @@ interface Props {
   markdown: string
   sourceIds: readonly number[]
   onCite: (sourceId: number) => void
+  citeLabel?: string // what a citation points to: a "source" (chat) or a "fact" (architecture)
 }
 
 /**
@@ -16,7 +17,7 @@ interface Props {
  * model output), and unsafe URLs (javascript:...) are removed by its default urlTransform.
  * Citations become buttons that point at the matching source below the answer.
  */
-export default function MarkdownAnswer({ markdown, sourceIds, onCite }: Props) {
+export default function MarkdownAnswer({ markdown, sourceIds, onCite, citeLabel = 'source' }: Props) {
   return (
     <div className="markdown">
       <Markdown
@@ -32,7 +33,7 @@ export default function MarkdownAnswer({ markdown, sourceIds, onCite }: Props) {
                   type="button"
                   className="cite"
                   onClick={() => onCite(id)}
-                  aria-label={`Show source ${id}`}
+                  aria-label={`Show ${citeLabel} ${id}`}
                 >
                   {children}
                 </button>

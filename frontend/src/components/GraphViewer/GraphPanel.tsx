@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
-import { getGraph } from '../../services/api'
-import { DEFAULT_GRAPH_NODES, MAX_GRAPH_NODES, type ProjectGraph } from '../../types/api'
+import { getGraph, getImpact } from '../../services/api'
+import { DEFAULT_GRAPH_NODES, DEFAULT_IMPACT_DEPTH, MAX_GRAPH_NODES, type ProjectGraph } from '../../types/api'
 import { errorText, formatNumber } from '../../utils/format'
 import LoadingState from '../LoadingState/LoadingState'
 import GraphCanvas from './GraphCanvas'
-import { entityColor, ENTITY_STYLES, relationshipColor } from './graphStyle'
+import { entityColor, ENTITY_STYLES, IMPACT_COLOR, relationshipColor } from './graphStyle'
+import ImpactPanel, { type ImpactState } from './ImpactPanel'
 import NodeDetails from './NodeDetails'
 import './GraphViewer.css'
 
@@ -104,13 +105,39 @@ function GraphView({ projectId, limit, analyzed }: { projectId: string; limit: n
           during embedding), so the project is not ready for chat. Run Analyze to finish it.
         </p>
       )}
-      <GraphExplorer graph={view.graph} />
+      <GraphExplorer projectId={projectId} graph={view.graph} />
     </>
   )
 }
 
-function GraphExplorer({ graph }: { graph: ProjectGraph }) {
+function GraphExplorer({ projectId, graph }: { projectId: string; graph: ProjectGraph }) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [impact, setImpact] = useState<ImpactState>({ state: 'idle' })
+  const [depth, setDepth] = useState(DEFAULT_IMPACT_DEPTH)
+
+  // Selecting another node (or none) ends the impact view of the previous one.
+  function select(nodeId: string | null) {
+    setSelectedId(nodeId)
+    setImpact({ state: 'idle' })
+  }
+
+  async function runImpact() {
+    if (!selectedId) return
+    const entityId = selectedId
+    setImpact({ state: 'loading' })
+    try {
+      const result = await getImpact(projectId, entityId, depth)
+      setImpact({ state: 'loaded', result })
+    } catch (error) {
+      setImpact({ state: 'error', message: errorText(error) })
+    }
+  }
+
+  // The affected entities, to highlight in the graph (only while an impact is shown).
+  const impacted = useMemo(
+    () => (impact.state === 'loaded' ? new Set(impact.result.affected.map((item) => item.entity.id)) : null),
+    [impact],
+  )
   const [hidden, setHidden] = useState<ReadonlySet<string>>(new Set())
   const [search, setSearch] = useState('')
   const [searchError, setSearchError] = useState<string | null>(null)
@@ -136,7 +163,7 @@ function GraphExplorer({ graph }: { graph: ProjectGraph }) {
       graph.nodes.find((node) => node.name.toLowerCase() === text || node.qualified_name.toLowerCase() === text) ??
       graph.nodes.find((node) => node.qualified_name.toLowerCase().includes(text))
     setSearchError(match ? null : `No node named “${search.trim()}” in the displayed graph.`)
-    if (match) setSelectedId(match.id)
+    if (match) select(match.id)
   }
 
   return (
@@ -166,6 +193,12 @@ function GraphExplorer({ graph }: { graph: ProjectGraph }) {
             Find
           </button>
         </form>
+        {impacted && (
+          <span className="legend-item impact-legend">
+            <span className="type-dot" style={{ borderColor: IMPACT_COLOR }} aria-hidden="true" />
+            Affected · {impacted.size}
+          </span>
+        )}
         <div className="legend" aria-label="Entity types">
           {Object.entries(entityCounts).map(([type, n]) => (
             <span key={type} className="legend-item">
@@ -192,9 +225,27 @@ function GraphExplorer({ graph }: { graph: ProjectGraph }) {
       </fieldset>
 
       <div className={`graph-layout${selectedId ? ' with-details' : ''}`}>
-        <GraphCanvas graph={graph} hiddenRelationships={hidden} selectedId={selectedId} onSelect={setSelectedId} />
+        <GraphCanvas
+          graph={graph}
+          hiddenRelationships={hidden}
+          selectedId={selectedId}
+          impacted={impacted}
+          onSelect={select}
+        />
         {selectedId ? (
-          <NodeDetails graph={graph} nodeId={selectedId} onSelect={setSelectedId} onClose={() => setSelectedId(null)} />
+          <NodeDetails graph={graph} nodeId={selectedId} onSelect={select} onClose={() => select(null)}>
+            <ImpactPanel
+              graph={graph}
+              impact={impact}
+              depth={depth}
+              onDepthChange={(value) => {
+                setDepth(value)
+                setImpact({ state: 'idle' })
+              }}
+              onRun={runImpact}
+              onSelect={select}
+            />
+          </NodeDetails>
         ) : (
           <p className="muted graph-hint">
             Click a node to see its details. Drag to pan, scroll or pinch to zoom.

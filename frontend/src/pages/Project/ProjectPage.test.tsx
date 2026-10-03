@@ -1,9 +1,9 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { describe, expect, it } from 'vitest'
-import type { AnalysisResponse, ChatResponse } from '../../types/api'
-import { ANALYSIS, CHAT, GRAPH, json, mockApi, NOT_ANALYZED, PROJECT, READY } from '../../test/mockApi'
+import type { ChatResponse } from '../../types/api'
+import { ANALYSIS, CHAT, DEPENDENCIES, GRAPH, json, mockApi, NOT_ANALYZED, PROJECT, READY } from '../../test/mockApi'
 import ProjectPage from './ProjectPage'
 
 const BASE = `/projects/${PROJECT.id}`
@@ -48,57 +48,6 @@ describe('ProjectPage', () => {
     renderProject('f'.repeat(32))
 
     expect(await screen.findByRole('heading', { name: 'Project not found' })).toBeInTheDocument()
-  })
-})
-
-describe('Analysis', () => {
-  it('runs once, shows a loading state, then the real statistics', async () => {
-    const pending = deferred()
-    const calls = mockApi({
-      ...PROJECT_ROUTES,
-      [`POST ${BASE}/analyze`]: () => pending.promise,
-    })
-    renderProject()
-    const button = await screen.findByRole('button', { name: 'Analyze Project' })
-
-    await userEvent.click(button)
-    expect(screen.getByText(/Analyzing codebase/)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Analyzing/ })).toBeDisabled()
-    await userEvent.click(screen.getByRole('button', { name: /Analyzing/ })) // ignored
-    expect(calls.filter((call) => call.path === `${BASE}/analyze`)).toHaveLength(1)
-
-    pending.resolve(json(ANALYSIS))
-    expect(await screen.findByText(/in 6\.9s\. The project is ready for chat/)).toBeInTheDocument()
-    expect(screen.getByText('Ready')).toBeInTheDocument()
-    const stats = screen.getByText('Entities').closest('dl') as HTMLElement
-    expect(within(stats).getByText('17')).toBeInTheDocument()
-    expect(within(stats).getByText('26')).toBeInTheDocument()
-    expect(within(stats).getByText('15')).toBeInTheDocument()
-    expect(screen.getByText('CALLS · 8')).toBeInTheDocument()
-    expect(screen.getByText('BAAI/bge-m3')).toBeInTheDocument()
-  })
-
-  it('shows the warnings returned by the backend', async () => {
-    const result: AnalysisResponse = { ...ANALYSIS, failed_files: 1, warnings: ['1 file(s) could not be parsed and were skipped.'] }
-    mockApi({ ...PROJECT_ROUTES, [`POST ${BASE}/analyze`]: () => json(result) })
-    renderProject()
-
-    await userEvent.click(await screen.findByRole('button', { name: 'Analyze Project' }))
-
-    expect(await screen.findByText('1 file(s) could not be parsed and were skipped.')).toBeInTheDocument()
-  })
-
-  it('shows a failure, never "Ready"', async () => {
-    mockApi({
-      ...PROJECT_ROUTES,
-      [`POST ${BASE}/analyze`]: () => json({ detail: 'Qdrant is not reachable.' }, 503),
-    })
-    renderProject()
-
-    await userEvent.click(await screen.findByRole('button', { name: 'Analyze Project' }))
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Analysis failed: Qdrant is not reachable.')
-    expect(screen.queryByText('Ready')).not.toBeInTheDocument()
   })
 })
 
@@ -209,54 +158,6 @@ describe('Chat', () => {
   })
 })
 
-describe('Persisted analysis state', () => {
-  it('restores "Ready" and the real counts after a reload, without analyzing again', async () => {
-    const calls = mockApi({ ...PROJECT_ROUTES, [`GET ${BASE}/analysis`]: () => json(READY) })
-    renderProject()
-
-    expect(await screen.findByText('Ready')).toBeInTheDocument()
-    const stats = screen.getByText('Entities').closest('dl') as HTMLElement
-    expect(within(stats).getByText('17')).toBeInTheDocument()
-    expect(within(stats).getByText('26')).toBeInTheDocument()
-    expect(within(stats).getByText('15')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Analyze again' })).toBeEnabled()
-    expect(calls.some((call) => call.method === 'POST')).toBe(false)
-  })
-
-  it('shows "Checking…" until the state is known', async () => {
-    const pending = deferred()
-    mockApi({ ...PROJECT_ROUTES, [`GET ${BASE}/analysis`]: () => pending.promise })
-    renderProject()
-
-    expect(await screen.findByText('Checking…')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Analyze/ })).not.toBeInTheDocument()
-    pending.resolve(json(NOT_ANALYZED))
-    expect(await screen.findByRole('button', { name: 'Analyze Project' })).toBeInTheDocument()
-  })
-
-  it('says when the state cannot be read', async () => {
-    mockApi({ ...PROJECT_ROUTES, [`GET ${BASE}/analysis`]: () => json({ detail: 'x' }, 500) })
-    renderProject()
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Could not read the analysis state.')
-  })
-
-  it('reports "Not analyzed" after a failed re-analysis, as the backend does', async () => {
-    mockApi({
-      ...PROJECT_ROUTES,
-      [`GET ${BASE}/analysis`]: () => json(READY),
-      [`POST ${BASE}/analyze`]: () => json({ detail: 'Neo4j is not reachable.' }, 503),
-    })
-    renderProject()
-
-    await userEvent.click(await screen.findByRole('button', { name: 'Analyze again' }))
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Neo4j is not reachable. The project is not ready')
-    expect(screen.getByText('Not analyzed')).toBeInTheDocument()
-    expect(screen.queryByText('Ready')).not.toBeInTheDocument()
-  })
-})
-
 describe('Knowledge Graph tab', () => {
   it('loads the graph only when opened, and keeps the chat history', async () => {
     const calls = mockApi({
@@ -283,18 +184,40 @@ describe('Knowledge Graph tab', () => {
   })
 
   it('reloads the graph after a new analysis', async () => {
+    const later = { ...READY, analysis: { ...ANALYSIS, analyzed_at: '2026-10-03T10:00:00Z' } }
+    let state = READY
     const calls = mockApi({
       ...PROJECT_ROUTES,
+      [`GET ${BASE}/analysis`]: () => json(state),
       [`GET ${BASE}/graph`]: () => json(GRAPH),
-      [`POST ${BASE}/analyze`]: () => json(ANALYSIS),
     })
     renderProject()
     await userEvent.click(await screen.findByRole('tab', { name: 'Knowledge Graph' }))
     await screen.findByText(/Complete graph/)
 
-    await userEvent.click(screen.getByRole('button', { name: 'Analyze Project' }))
-    await screen.findByText('Ready')
+    // A new analysis finished (another analyzed_at): the page is opened again.
+    state = later
+    cleanup()
+    renderProject()
+    await userEvent.click(await screen.findByRole('tab', { name: 'Knowledge Graph' }))
 
     await waitFor(() => expect(calls.filter((call) => call.path === `${BASE}/graph`)).toHaveLength(2))
+  })
+
+  it('opens the insights only when asked', async () => {
+    const calls = mockApi({
+      ...PROJECT_ROUTES,
+      [`GET ${BASE}/analysis`]: () => json(READY),
+      [`GET ${BASE}/analysis/dependencies`]: () => json(DEPENDENCIES),
+    })
+    renderProject()
+    await screen.findByText('Ready')
+    expect(calls.some((call) => call.path.endsWith('/dependencies'))).toBe(false)
+
+    await userEvent.click(screen.getByRole('tab', { name: 'Insights' }))
+
+    expect(await screen.findByRole('heading', { name: 'Dependency analysis' })).toBeInTheDocument()
+    expect(calls.filter((call) => call.path.endsWith('/dependencies'))).toHaveLength(1)
+    expect(calls.some((call) => call.path.endsWith('/architecture'))).toBe(false) // no LLM call unasked
   })
 })

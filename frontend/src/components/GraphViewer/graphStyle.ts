@@ -26,6 +26,7 @@ export const RELATIONSHIP_COLORS: Record<string, string> = {
 }
 
 const NEUTRAL = '#9ca3af'
+export const IMPACT_COLOR = '#e11d48'
 
 export function entityColor(entityType: string): string {
   return ENTITY_STYLES[entityType]?.color ?? NEUTRAL
@@ -98,6 +99,8 @@ export function graphStylesheet(text: string, background: string): StylesheetJso
     },
     { selector: 'edge[type = "CONTAINS"]', style: { 'line-style': 'dashed', opacity: 0.5 } },
     { selector: '.faded', style: { opacity: 0.12 } },
+    // Affected by a change of the selected node (impact analysis).
+    { selector: 'node.impacted', style: { 'border-width': 3, 'border-color': IMPACT_COLOR, width: 22, height: 22 } },
     {
       selector: 'node:selected',
       style: { 'border-width': 3, 'border-color': text, width: 26, height: 26, 'font-size': 12 },

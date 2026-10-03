@@ -1,123 +1,197 @@
 import { useEffect, useState } from 'react'
-import type { AnalysisState } from '../../hooks/useAnalysis'
-import type { AnalysisResponse } from '../../types/api'
+import { isActive, type AnalysisView } from '../../hooks/useAnalysis'
+import type { AnalysisJob, AnalysisPhase, AnalysisResponse, AnalysisStatus } from '../../types/api'
 import { formatDate, formatNumber } from '../../utils/format'
 import LoadingState from '../LoadingState/LoadingState'
 import './AnalysisPanel.css'
 
 interface Props {
-  analysis: AnalysisState
-  onAnalyze: () => void
+  view: AnalysisView
+  onAnalyze: (full?: boolean) => void
 }
 
-// What POST /analyze does on the server. Shown as a description, not as progress:
-// the endpoint is synchronous and reports nothing until it has finished.
-const STEPS = [
-  'Parsing source files',
-  'Building the knowledge graph (Neo4j)',
-  'Generating embeddings (BGE-M3)',
-  'Indexing code chunks (Qdrant)',
+// The phases of an analysis job, in the order the backend runs them.
+const PHASES: [AnalysisPhase, string][] = [
+  ['preparing', 'Preparing (databases, embedding model)'],
+  ['detecting_changes', 'Detecting changed files'],
+  ['parsing', 'Parsing changed files'],
+  ['resolving', 'Resolving relationships'],
+  ['embedding', 'Embedding changed code'],
+  ['graph', 'Updating the knowledge graph (Neo4j)'],
+  ['vector_index', 'Updating the vector index (Qdrant)'],
+  ['finalizing', 'Finalizing'],
 ]
 
-/** The analysis state persisted by the backend, the Analyze button, and the last report. */
-export default function AnalysisPanel({ analysis, onAnalyze }: Props) {
-  const isRunning = analysis.state === 'running'
-  const isLoading = analysis.state === 'loading'
+/** The analysis state persisted by the backend: the job's real progress and the last report. */
+export default function AnalysisPanel({ view, onAnalyze }: Props) {
   return (
     <section className="card" aria-labelledby="analysis-title">
       <div className="analysis-head">
         <div>
           <h2 id="analysis-title">Analysis</h2>
           <p className="card-subtitle">
-            Builds the knowledge graph and the semantic index that chat answers from. Run it
-            after importing, and again after the code changes (re-running is safe).
+            Builds the knowledge graph and the semantic index that chat answers from. It runs in
+            the background; after the first time, only the files that changed are processed.
           </p>
         </div>
-        <StatusBadge analysis={analysis} />
+        <StatusBadge view={view} />
       </div>
 
-      {isLoading ? (
-        <LoadingState label="Checking the analysis state…" />
-      ) : (
-        <button className="button" type="button" onClick={onAnalyze} disabled={isRunning}>
-          {isRunning && <span className="spinner" aria-hidden="true" />}
-          {isRunning ? 'Analyzing…' : analysis.state === 'ready' ? 'Analyze again' : 'Analyze Project'}
-        </button>
+      {view.state === 'loading' && <LoadingState label="Checking the analysis state…" />}
+      {view.state === 'load-error' && (
+        <p className="alert error" role="alert">
+          Could not read the analysis state. {view.message}
+        </p>
       )}
+      {view.state === 'loaded' && (
+        <Loaded status={view.status} startError={view.startError} pollError={view.pollError} onAnalyze={onAnalyze} />
+      )}
+    </section>
+  )
+}
 
-      {analysis.state === 'not_analyzed' && (
+function Loaded({
+  status,
+  startError,
+  pollError,
+  onAnalyze,
+}: {
+  status: AnalysisStatus
+  startError: string | null
+  pollError: string | null
+  onAnalyze: (full?: boolean) => void
+}) {
+  const active = isActive(status)
+  const { job, analysis } = status
+  return (
+    <>
+      <div className="analysis-actions">
+        <button className="button" type="button" onClick={() => onAnalyze(false)} disabled={active}>
+          {active && <span className="spinner" aria-hidden="true" />}
+          {active ? 'Analyzing…' : analysis ? 'Analyze again' : 'Analyze Project'}
+        </button>
+        {analysis && !active && (
+          <button
+            className="button secondary"
+            type="button"
+            onClick={() => onAnalyze(true)}
+            title="Parse and embed every file again, instead of only what changed"
+          >
+            Full re-analysis
+          </button>
+        )}
+      </div>
+
+      {startError && (
+        <p className="alert error" role="alert">
+          The analysis could not be started: {startError}
+        </p>
+      )}
+      {status.status === 'not_analyzed' && (
         <p className="muted analysis-note">
           This project has not been analyzed yet. Analyze it to build its knowledge graph and
           make it ready for chat.
         </p>
       )}
-      {analysis.state === 'load-error' && (
+      {active && job && <Progress job={job} pollError={pollError} />}
+      {status.status === 'failed' && job && (
         <p className="alert error" role="alert">
-          Could not read the analysis state. {analysis.message}
+          Analysis failed: {job.error ?? 'unknown error.'}{' '}
+          {analysis
+            ? 'Nothing was changed: the previous analysis below is still valid and chat keeps using it.'
+            : 'The project is not ready: analyze it again.'}
         </p>
       )}
-      {analysis.state === 'running' && <Running startedAt={analysis.startedAt} />}
-      {analysis.state === 'failed' && (
-        <p className="alert error" role="alert">
-          Analysis failed: {analysis.message} The project is not ready: analyze it again.
-        </p>
-      )}
-      {analysis.state === 'ready' && <AnalysisResult result={analysis.result} />}
-    </section>
+      {analysis && <AnalysisResult result={analysis} stale={status.status !== 'ready'} />}
+    </>
   )
 }
 
-function StatusBadge({ analysis }: { analysis: AnalysisState }) {
-  switch (analysis.state) {
-    case 'loading':
-      return <span className="badge">Checking…</span>
+function StatusBadge({ view }: { view: AnalysisView }) {
+  if (view.state === 'loading') return <span className="badge">Checking…</span>
+  if (view.state === 'load-error') return <span className="badge error">Unknown</span>
+  switch (view.status.status) {
+    case 'queued':
+      return <span className="badge accent">Queued</span>
     case 'running':
       return <span className="badge accent">Analyzing</span>
     case 'ready':
       return <span className="badge ok">Ready</span>
     case 'failed':
-      return <span className="badge error">Not analyzed</span>
-    case 'load-error':
-      return <span className="badge error">Unknown</span>
+      return <span className="badge error">Failed</span>
     default:
       return <span className="badge">Not analyzed</span>
   }
 }
 
-function Running({ startedAt }: { startedAt: number }) {
-  const [seconds, setSeconds] = useState(0)
-  useEffect(() => {
-    const timer = setInterval(() => setSeconds(Math.floor((Date.now() - startedAt) / 1000)), 1000)
-    return () => clearInterval(timer)
-  }, [startedAt])
-
+/** The job's real progress: its phase, and counts only when the backend counted something. */
+function Progress({ job, pollError }: { job: AnalysisJob; pollError: string | null }) {
+  const seconds = useElapsedSeconds(job.started_at)
+  const current = PHASES.findIndex(([phase]) => phase === job.phase)
+  const counted = job.completed !== null && job.total !== null
   return (
     <div className="analysis-running" role="status">
       <p className="analysis-running-title">
         <span className="spinner" aria-hidden="true" />
-        Analyzing codebase… <span className="muted">({seconds}s elapsed)</span>
+        {job.status === 'queued' ? 'Waiting for the analysis worker…' : 'Analysis running'}
+        {job.status === 'running' && seconds !== null && <span className="muted">({seconds}s elapsed)</span>}
+        {job.mode && <span className="badge">{job.mode === 'full' ? 'Full analysis' : 'Incremental'}</span>}
       </p>
-      <ul className="steps">
-        {STEPS.map((step) => (
-          <li key={step}>{step}</li>
-        ))}
-      </ul>
+      {job.status === 'running' && (
+        <ol className="steps">
+          {PHASES.map(([phase, label], index) => (
+            <li
+              key={phase}
+              className={index < current ? 'done' : index === current ? 'current' : ''}
+              aria-current={index === current ? 'step' : undefined}
+            >
+              {label}
+              {index === current && counted && (
+                <span className="step-count">
+                  {' '}
+                  {formatNumber(job.completed ?? 0)} / {formatNumber(job.total ?? 0)} {job.unit}
+                </span>
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+      {job.status === 'running' && counted && (job.total ?? 0) > 0 && (
+        // A real measure: completed and total come from the backend's own counters.
+        <progress
+          className="analysis-progress"
+          value={job.completed ?? 0}
+          max={job.total ?? 0}
+          aria-label={`${job.phase}: ${job.completed} of ${job.total} ${job.unit}`}
+        />
+      )}
+      {pollError && <p className="muted analysis-note">Could not refresh the progress ({pollError}). Retrying…</p>}
       <p className="muted analysis-note">
-        Embedding with BGE-M3 runs on the server and can take from seconds for a small project
-        to several minutes for a large one; the first analysis also loads the model.
+        The analysis runs on the server: you can leave or reload this page, the progress is kept.
       </p>
     </div>
   )
 }
 
-function AnalysisResult({ result }: { result: AnalysisResponse }) {
-  const { graph, vectors } = result
-  const stale = graph.stale_entities_removed + vectors.stale_chunks_removed
+function useElapsedSeconds(startedAt: string | null): number | null {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!startedAt) return
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [startedAt])
+  if (!startedAt) return null
+  return Math.max(0, Math.floor((now - new Date(startedAt).getTime()) / 1000))
+}
+
+function AnalysisResult({ result, stale }: { result: AnalysisResponse; stale: boolean }) {
+  const { graph, vectors, changes } = result
   return (
     <div className="analysis-result">
-      <p className="alert ok" role="status">
-        Analyzed on {formatDate(result.analyzed_at)} in {result.duration_seconds.toFixed(1)}s.
-        The project is ready for chat.
+      <p className={stale ? 'alert' : 'alert ok'} role="status">
+        {stale ? 'Last analysis: ' : 'Analyzed on '}
+        {formatDate(result.analyzed_at)} in {result.duration_seconds.toFixed(1)}s.
+        {!stale && ' The project is ready for chat.'}
       </p>
 
       <dl className="stats">
@@ -126,6 +200,17 @@ function AnalysisResult({ result }: { result: AnalysisResponse }) {
         <Stat label="Relationships" value={graph.relationships} />
         <Stat label="Code chunks" value={vectors.chunks} />
       </dl>
+
+      <p className="analysis-changes">
+        <span className="badge">{result.mode === 'full' ? 'Full analysis' : 'Incremental analysis'}</span>{' '}
+        {result.mode === 'full'
+          ? `Every file was processed: ${formatNumber(changes.files_parsed)} files parsed, ${formatNumber(changes.chunks_embedded)} chunks embedded.`
+          : `${formatNumber(changes.files_parsed)} of ${formatNumber(graph.files + result.failed_files)} files parsed ` +
+            `(${changes.files_added} added, ${changes.files_modified} modified, ${changes.files_deleted} deleted, ` +
+            `${formatNumber(changes.files_unchanged)} unchanged); ${formatNumber(changes.chunks_embedded)} chunks embedded, ` +
+            `${formatNumber(changes.chunks_reused)} reused` +
+            (changes.chunks_deleted > 0 ? `, ${formatNumber(changes.chunks_deleted)} removed.` : '.')}
+      </p>
 
       <div className="breakdowns">
         <Breakdown title="Entities by type" counts={graph.entities_by_type} />
@@ -136,8 +221,6 @@ function AnalysisResult({ result }: { result: AnalysisResponse }) {
       <p className="muted analysis-note">
         Embedding model: <code>{vectors.embedding_model}</code> · Unresolved references
         (e.g. libraries): {formatNumber(graph.unresolved_references)}
-        {stale > 0 &&
-          ` · Removed from a previous analysis: ${formatNumber(graph.stale_entities_removed)} entities, ${formatNumber(vectors.stale_chunks_removed)} chunks`}
         {result.failed_files > 0 && ` · Files skipped: ${formatNumber(result.failed_files)}`}
       </p>
 

@@ -3,6 +3,7 @@ import { Link, useLocation, useParams } from 'react-router'
 import AnalysisPanel from '../../components/AnalysisPanel/AnalysisPanel'
 import Chat from '../../components/Chat/Chat'
 import GraphPanel from '../../components/GraphViewer/GraphPanel'
+import InsightsPanel from '../../components/Insights/InsightsPanel'
 import LoadingState from '../../components/LoadingState/LoadingState'
 import ProjectHeader from '../../components/ProjectHeader/ProjectHeader'
 import { useAnalysis } from '../../hooks/useAnalysis'
@@ -17,9 +18,9 @@ type PageState =
   | { state: 'error'; message: string }
   | { state: 'loaded'; project: Project }
 
-type Tab = 'chat' | 'graph'
+type Tab = 'chat' | 'graph' | 'insights'
 
-/** The project workspace: its metadata, the analysis, the chat and the knowledge graph. */
+/** The project workspace: its metadata, the analysis, the chat, the graph and the insights. */
 export default function ProjectPage() {
   const { projectId = '' } = useParams()
   // A new project ID remounts the workspace: its state (analysis, chat) starts fresh.
@@ -30,17 +31,21 @@ function ProjectWorkspace({ projectId }: { projectId: string }) {
   const location = useLocation()
   const justImported = (location.state as { imported?: boolean } | null)?.imported === true
   const [page, setPage] = useState<PageState>({ state: 'loading' })
-  const { analysis, analyze } = useAnalysis(projectId)
+  const { view, analyze } = useAnalysis(projectId)
   const [tab, setTab] = useState<Tab>('chat')
-  const [graphOpened, setGraphOpened] = useState(false) // load the graph on first view only
+  // The graph and the insights are loaded the first time their tab is opened.
+  const [opened, setOpened] = useState<ReadonlySet<Tab>>(new Set(['chat']))
 
   function openTab(next: Tab) {
     setTab(next)
-    if (next === 'graph') setGraphOpened(true)
+    setOpened((current) => new Set(current).add(next))
   }
 
-  const analyzed = analysis.state === 'loading' ? null : analysis.state === 'ready'
-  const analyzedAt = analysis.state === 'ready' ? analysis.result.analyzed_at : null
+  // "Analyzed" means the databases hold a complete analysis (even while a new job runs).
+  const report = view.state === 'loaded' ? view.status.analysis : null
+  const analyzed = view.state === 'loading' ? null : report !== null
+  const analyzedAt = report?.analyzed_at ?? null
+  const notAnalyzed = view.state === 'loaded' && view.status.status === 'not_analyzed'
 
   useEffect(() => {
     let current = true // ignore a late answer after leaving the page
@@ -80,23 +85,29 @@ function ProjectWorkspace({ projectId }: { projectId: string }) {
       )}
       {page.state === 'loaded' && (
         <>
-          {justImported && analysis.state === 'not_analyzed' && (
+          {justImported && notAnalyzed && (
             <p className="alert ok" role="status">
               Project imported. Next step: analyze it, then ask questions.
             </p>
           )}
           <ProjectHeader project={page.project} />
-          <AnalysisPanel analysis={analysis} onAnalyze={analyze} />
+          <AnalysisPanel view={view} onAnalyze={analyze} />
           <div className="tabs" role="tablist" aria-label="Project tools">
             <TabButton id="chat" label="Chat" active={tab} onSelect={openTab} />
             <TabButton id="graph" label="Knowledge Graph" active={tab} onSelect={openTab} />
+            <TabButton id="insights" label="Insights" active={tab} onSelect={openTab} />
           </div>
-          {/* Both stay mounted once opened: switching tabs keeps the chat history and the graph. */}
+          {/* Tabs stay mounted once opened: switching keeps the chat history, the graph, the insights. */}
           <div id="panel-chat" role="tabpanel" aria-labelledby="tab-chat" hidden={tab !== 'chat'}>
             <Chat projectId={projectId} />
           </div>
           <div id="panel-graph" role="tabpanel" aria-labelledby="tab-graph" hidden={tab !== 'graph'}>
-            {graphOpened && <GraphPanel projectId={projectId} analyzed={analyzed} analyzedAt={analyzedAt} />}
+            {opened.has('graph') && <GraphPanel projectId={projectId} analyzed={analyzed} analyzedAt={analyzedAt} />}
+          </div>
+          <div id="panel-insights" role="tabpanel" aria-labelledby="tab-insights" hidden={tab !== 'insights'}>
+            {opened.has('insights') && (
+              <InsightsPanel projectId={projectId} analyzed={analyzed} analyzedAt={analyzedAt} />
+            )}
           </div>
         </>
       )}

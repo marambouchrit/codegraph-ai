@@ -2,19 +2,25 @@ import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import type { ProjectGraph } from '../../types/api'
-import { GRAPH, json, mockApi, PROJECT } from '../../test/mockApi'
+import { GRAPH, IMPACT, json, mockApi, PROJECT } from '../../test/mockApi'
 import GraphPanel from './GraphPanel'
 
 // jsdom has no canvas: replace the Cytoscape view by a list of the nodes it receives,
 // with a button per node to simulate a click on it.
 vi.mock('./GraphCanvas', () => ({
-  default: ({ graph, hiddenRelationships, selectedId, onSelect }: {
+  default: ({ graph, hiddenRelationships, selectedId, impacted, onSelect }: {
     graph: ProjectGraph
     hiddenRelationships: ReadonlySet<string>
     selectedId: string | null
+    impacted: ReadonlySet<string> | null
     onSelect: (id: string | null) => void
   }) => (
-    <div data-testid="canvas" data-selected={selectedId ?? ''} data-hidden={[...hiddenRelationships].join(',')}>
+    <div
+      data-testid="canvas"
+      data-selected={selectedId ?? ''}
+      data-hidden={[...hiddenRelationships].join(',')}
+      data-impacted={impacted ? [...impacted].join(',') : 'none'}
+    >
       {graph.nodes.map((node) => (
         <button key={node.id} type="button" onClick={() => onSelect(node.id)}>
           node:{node.name}
@@ -180,5 +186,100 @@ describe('GraphPanel', () => {
 
     expect(screen.getByText('Checking the analysis state…')).toBeInTheDocument()
     expect(calls).toHaveLength(0)
+  })
+
+  // ----- Impact analysis -----
+
+  const IMPACT_PATH = `/projects/${PROJECT.id}/analysis/impact`
+
+  async function openFindUser() {
+    await userEvent.click(await screen.findByRole('button', { name: 'node:find_user' }))
+  }
+
+  it('runs the impact analysis of the selected node and highlights the affected ones', async () => {
+    mockApi({ [`GET ${PATH}`]: () => json(GRAPH), [`GET ${IMPACT_PATH}`]: () => json(IMPACT) })
+    renderPanel()
+    await openFindUser()
+    expect(screen.getByTestId('canvas')).toHaveAttribute('data-impacted', 'none')
+
+    await userEvent.click(screen.getByRole('button', { name: 'Impact analysis' }))
+
+    const details = screen.getByRole('complementary')
+    expect(await within(details).findByText(/may be affected/)).toHaveTextContent('2 entities may be affected.')
+    // The request names the selected entity and the default depth.
+    const url = new URL(String(vi.mocked(fetch).mock.calls.at(-1)?.[0]))
+    expect(url.pathname).toBe(IMPACT_PATH)
+    expect(url.searchParams.get('entity_id')).toBe(GRAPH.nodes[3].id)
+    expect(url.searchParams.get('depth')).toBe('3')
+    // Grouped by distance, with how each one is reached.
+    expect(details).toHaveTextContent('Direct (depth 1) · 1CALLSAuthService.loginauth/service.py')
+    expect(details).toHaveTextContent('Depth 2 · 1CALLSlogin_routeapi/routes.py')
+    // Both affected entities are sent to the graph for highlighting.
+    expect(screen.getByTestId('canvas').dataset.impacted?.split(',')).toEqual(
+      IMPACT.affected.map((item) => item.entity.id),
+    )
+    expect(screen.getByText('Affected · 2')).toBeInTheDocument()
+  })
+
+  it('links affected entities of the displayed graph, and says which are not displayed', async () => {
+    mockApi({ [`GET ${PATH}`]: () => json(GRAPH), [`GET ${IMPACT_PATH}`]: () => json(IMPACT) })
+    renderPanel()
+    await openFindUser()
+    await userEvent.click(screen.getByRole('button', { name: 'Impact analysis' }))
+    const details = screen.getByRole('complementary')
+    await within(details).findByText(/may be affected/)
+
+    const impact = details.querySelector('.impact') as HTMLElement
+    expect(within(impact).queryByRole('button', { name: 'login_route' })).not.toBeInTheDocument()
+    expect(impact).toHaveTextContent('1 of them is not in the displayed graph')
+    // Following an affected entity selects it, and ends this impact view.
+    await userEvent.click(within(impact).getByRole('button', { name: 'AuthService.login' }))
+    expect(within(screen.getByRole('complementary')).getByRole('heading', { name: 'login' })).toBeInTheDocument()
+    expect(screen.getByTestId('canvas')).toHaveAttribute('data-impacted', 'none')
+  })
+
+  it('asks for the chosen depth', async () => {
+    mockApi({ [`GET ${PATH}`]: () => json(GRAPH), [`GET ${IMPACT_PATH}`]: () => json(IMPACT) })
+    renderPanel()
+    await openFindUser()
+
+    await userEvent.selectOptions(screen.getByLabelText('Impact depth'), '5')
+    await userEvent.click(screen.getByRole('button', { name: 'Impact analysis' }))
+
+    await screen.findByText(/may be affected/)
+    expect(new URL(String(vi.mocked(fetch).mock.calls.at(-1)?.[0])).searchParams.get('depth')).toBe('5')
+  })
+
+  it('says when nothing references the entity, without calling it unused', async () => {
+    const none = { ...IMPACT, affected: [], total: 0, by_depth: {} }
+    mockApi({ [`GET ${PATH}`]: () => json(GRAPH), [`GET ${IMPACT_PATH}`]: () => json(none) })
+    renderPanel()
+    await openFindUser()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Impact analysis' }))
+
+    expect(await screen.findByText(/No detected reference to this entity within 3 steps/)).toHaveTextContent(
+      'Dynamic calls are not detected.',
+    )
+    expect(screen.getByTestId('canvas')).toHaveAttribute('data-impacted', '')
+  })
+
+  it('says when the impact list is truncated, and shows an error', async () => {
+    let fail = false
+    mockApi({
+      [`GET ${PATH}`]: () => json(GRAPH),
+      [`GET ${IMPACT_PATH}`]: () =>
+        fail ? json({ detail: 'Neo4j is not reachable.' }, 503) : json({ ...IMPACT, truncated: true }),
+    })
+    renderPanel()
+    await openFindUser()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Impact analysis' }))
+    expect(await screen.findByText(/more exist: the list is truncated/)).toBeInTheDocument()
+
+    fail = true
+    await userEvent.click(screen.getByRole('button', { name: 'Impact analysis' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('The impact analysis failed. Neo4j is not reachable.')
+    expect(screen.getByTestId('canvas')).toHaveAttribute('data-impacted', 'none')
   })
 })

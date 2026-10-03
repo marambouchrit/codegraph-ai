@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
-import { GRAPH, json, mockApi, PROJECT, READY } from '../test/mockApi'
+import { ARCHITECTURE, DEPENDENCIES, GRAPH, IMPACT, json, mockApi, PROJECT, QUEUED, READY } from '../test/mockApi'
 import {
   analyzeProject,
   ApiError,
   askQuestion,
   getAnalysis,
+  getArchitecture,
+  getDependencies,
   getGraph,
+  getImpact,
   getProject,
   importFromGithub,
   uploadProjectZip,
@@ -29,11 +32,37 @@ describe('api requests match the backend contract', () => {
     expect((body.get('file') as File).name).toBe('auth.zip')
   })
 
-  it('analyzes with a POST and no body', async () => {
-    const calls = mockApi({ [`POST /projects/${PROJECT.id}/analyze`]: () => json({}) })
+  it('starts an analysis with a POST and no body, and gets the queued job back', async () => {
+    const calls = mockApi({ [`POST /projects/${PROJECT.id}/analyze`]: () => json(QUEUED, 202) })
 
-    await analyzeProject(PROJECT.id)
+    await expect(analyzeProject(PROJECT.id)).resolves.toEqual(QUEUED)
     expect(calls[0].init?.body).toBeUndefined()
+    expect(String(vi.mocked(fetch).mock.calls[0][0])).toMatch(/\/analyze$/)
+
+    await analyzeProject(PROJECT.id, true)
+    expect(String(vi.mocked(fetch).mock.calls[1][0])).toMatch(/\/analyze\?full=true$/)
+  })
+
+  it('reads the impact of an entity, with its ID safely encoded', async () => {
+    mockApi({ [`GET /projects/${PROJECT.id}/analysis/impact`]: () => json(IMPACT) })
+    const entityId = `${PROJECT.id}:src/a b.py:User.save&x=1`
+
+    await expect(getImpact(PROJECT.id, entityId, 2)).resolves.toEqual(IMPACT)
+    const url = new URL(String(vi.mocked(fetch).mock.calls[0][0]))
+    expect(url.searchParams.get('entity_id')).toBe(entityId) // not split by "&" or spaces
+    expect(url.searchParams.get('depth')).toBe('2')
+    expect([...url.searchParams.keys()]).toEqual(['entity_id', 'depth'])
+  })
+
+  it('reads the dependency analysis and the architecture overview', async () => {
+    const calls = mockApi({
+      [`GET /projects/${PROJECT.id}/analysis/dependencies`]: () => json(DEPENDENCIES),
+      [`GET /projects/${PROJECT.id}/analysis/architecture`]: () => json(ARCHITECTURE),
+    })
+
+    await expect(getDependencies(PROJECT.id)).resolves.toEqual(DEPENDENCIES)
+    await expect(getArchitecture(PROJECT.id)).resolves.toEqual(ARCHITECTURE)
+    expect(calls.map((call) => call.method)).toEqual(['GET', 'GET'])
   })
 
   it('reads the analysis state', async () => {

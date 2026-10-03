@@ -32,15 +32,15 @@ Question → query analysis
 
 | Component          | Responsibility                                      | Status   |
 | ------------------ | --------------------------------------------------- | -------- |
-| React frontend     | Import projects, explore code, chat, view the graph | ✅ Import, analysis, chat (12), graph (13) |
-| FastAPI backend    | HTTP API, orchestration                             | Project, analysis, graph and chat APIs |
+| React frontend     | Import projects, explore code, chat, view the graph | ✅ Import, analysis, chat (12), graph (13), progress and insights (14) |
+| FastAPI backend    | HTTP API, orchestration                             | Project, analysis (background jobs), graph, insights and chat APIs |
 | Repository manager | Clone / extract / scan repositories                 | ✅ Phase 2 |
 | Code analyzer      | Tree-sitter parsing, entity & relationship extraction | ✅ Parsing (3), entities (4), relationships (5) |
 | Graph engine       | Neo4j storage and graph queries                     | ✅ Storage (6), retrieval (7) |
 | RAG engine         | Chunking, embeddings, Qdrant, hybrid retrieval      | ✅ Vector search (8), GraphRAG (9) |
 | Chat engine        | Prompting and LLM provider abstraction              | ✅ Phase 10, endpoint in Phase 11 |
 
-## Current backend layout (Phase 13)
+## Current backend layout (Phase 14)
 
 ```
 backend/app/
@@ -55,12 +55,14 @@ backend/app/
 │   └── routes/
 │       ├── health.py        # GET /health
 │       ├── projects.py      # /projects endpoints (thin: call the service, return schemas)
-│       ├── analysis.py      # POST /projects/{id}/analyze, GET /projects/{id}/analysis
+│       ├── analysis.py      # POST /projects/{id}/analyze (202, background), GET .../analysis
+│       ├── insights.py      # GET .../analysis/impact, /dependencies, /architecture
 │       ├── graph.py         # GET /projects/{id}/graph (bounded, read-only)
 │       └── chat.py          # POST /projects/{id}/chat
 ├── schemas/                 # API request/response models
 │   ├── project.py
-│   ├── analysis.py          # AnalysisResponse, AnalysisStatusResponse
+│   ├── analysis.py          # AnalysisStatusResponse (status, job, progress, report)
+│   ├── insights.py          # ImpactResponse, DependencyResponse, ArchitectureResponse
 │   ├── graph.py             # ProjectGraphResponse (nodes, edges, truncated, totals)
 │   └── chat.py              # ChatRequest (question only), ChatResponse, ChatSource
 ├── services/                # orchestration: the only places combining the packages below
@@ -70,10 +72,18 @@ backend/app/
 │   ├── vector_index_service.py     # vector index: files -> chunks -> embeddings -> Qdrant
 │   ├── vector_retrieval_service.py # semantic search: validation, top_k, filters
 │   ├── graphrag_service.py  # GraphRAG: vector hits -> seeds -> graph expansion -> context
-│   ├── analysis_service.py  # analyze: project check -> graph build -> vector indexing
-│   ├── analysis_store.py    # analysis.json: the last successful analysis of a project
+│   ├── analysis_service.py  # analysis jobs: start (202), run on the worker, state
+│   ├── analysis_pipeline.py # one analysis, full or incremental: detect, parse, embed, write
+│   ├── analysis_store.py    # analysis.json: the job, its progress, the last result
+│   ├── insights_service.py  # impact, dependencies, architecture: project check -> analyses
 │   ├── project_graph_service.py  # graph for display: project check -> bounded retrieval
 │   └── chat_service.py      # chat: project check -> GraphRAG -> LLM answer
+├── analysis/                # Phase 14: pure logic, no database or HTTP
+│   ├── changes.py           # SHA-256 of files, added/modified/unchanged/deleted
+│   ├── index.py             # analysis_index.json: per-file results and fingerprints
+│   ├── jobs.py              # ThreadJobRunner: one in-process background thread
+│   ├── insights.py          # file dependencies, cycles (Tarjan), hubs, unreferenced
+│   └── architecture.py      # numbered architecture facts computed from the graph
 ├── ingestion/               # small, independent building blocks
 │   ├── github.py            # URL validation + safe shallow `git clone`
 │   ├── zip_handler.py       # safe ZIP extraction
@@ -1301,7 +1311,251 @@ routes/graph.py            limit validated by FastAPI (1..500) -> 422
   truncated, is one of the questions asked to both real Neo4j and the fake; their answers are
   identical.
 
-## Frontend (Phases 12-13)
+## Incremental background analysis (Phase 14)
+
+Until Phase 13, `POST /analyze` kept the HTTP request open and processed every file and
+every chunk again at each call. Phase 14 changes both: the analysis runs as a background
+job with real progress, and a re-analysis only processes what changed.
+
+### The pipeline (`services/analysis_pipeline.py`)
+
+```
+preparing          Neo4j and Qdrant answer, the embedding model is loaded
+detecting_changes  SHA-256 of every source file, compared with the saved index
+parsing            added and modified files only: entities, raw references, chunks (one parse)
+resolving          relationships resolved over ALL files (cached + new), graph and chunk plans
+embedding          only chunks whose embedded text changed
+------ nothing was written until here ------
+graph              Neo4j: write new/changed nodes and relationships, delete the gone
+vector_index       Qdrant: write new vectors, refresh moved metadata, delete the gone
+finalizing         save the index for the next analysis
+```
+
+It adds no parser, resolver, graph writer or embedder. It calls the existing
+`EntityExtractionService`, `RelationshipExtractionService.collect()` / `.resolve()`,
+`GraphBuilder`, `CodeChunker` and `VectorIndexService`.
+
+### Change detection (`analysis/changes.py`)
+
+Each source file gets the **SHA-256 of its bytes**. Comparing today's hashes with those saved
+by the last successful analysis classifies every file as **added, modified, unchanged or
+deleted**. Modification times are never used: a file rewritten with the same content is
+unchanged.
+
+### The analysis index (`analysis/index.py`)
+
+`workspace/<id>/analysis_index.json` is what the last successful analysis knew:
+
+| Stored | Used for |
+| --- | --- |
+| per file: SHA-256 | change detection |
+| per file: entities and raw references (imports, calls, base classes, variable types) | resolving relationships again without parsing the file |
+| per file: chunk ID → content hash, payload hash | deciding which chunks need a new embedding |
+| per node and relationship: a fingerprint | writing only the differences to Neo4j |
+| embedding model, collection, chunking settings | detecting that the vectors must all be rebuilt |
+
+### Why relationships are resolved over the whole project
+
+A relationship can change although its file did not. If `B.py` is deleted, the call
+`A.login -> B.find_user` must disappear even though `A.py` is unchanged; if a function is
+added, a call that was unresolved yesterday resolves today. So only **parsing** is
+incremental: unchanged files contribute their cached entities and raw references, and
+`resolve()` (in memory, with no file read) runs over everything. The result is the exact
+graph a full analysis would give (tested: same nodes, relationships and vectors).
+
+### Incremental Neo4j update
+
+`diff_graph()` compares the new nodes and relationships with the saved fingerprints:
+
+- **New or changed** (lines moved, renamed...): `GraphBuilder.apply()` upserts them with the
+  existing `MERGE` queries.
+- **Gone:** they are deleted by ID with two new fixed queries, `DELETE_NODES_BY_ID` and
+  `DELETE_RELATIONSHIPS_BY_ID`. Both are parameterized and scoped by `project_id`.
+- **Untouched:** not sent to Neo4j at all.
+
+Writes come before deletes, as in a full build.
+
+### Incremental Qdrant update and embedding reuse
+
+A chunk's ID is deterministic (`<entity_id>|<part>`, Phase 8), and its Qdrant point ID is
+derived from it. Each chunk also gets two hashes:
+
+- **content hash** = SHA-256 of the embedding model name + the text that is embedded;
+- **payload hash** = a fingerprint of its metadata (file, lines, names).
+
+| The chunk... | Action | Embedding |
+| --- | --- | --- |
+| is new, or its content hash changed | embed, upsert (same point ID: replaced, never duplicated) | yes |
+| has the same content but another payload (the code moved to other lines) | `overwrite_payload` | **no**, the vector is kept |
+| is identical | nothing | no |
+| no longer exists | `delete_chunks` (by point ID, filtered by project) | no |
+
+### When the analysis is full instead
+
+A full analysis parses and embeds everything and uses the stale cleanup of Phases 6 and 8,
+which also repairs leftovers. It happens when:
+
+- there is no index yet (first analysis, or a project analyzed before Phase 14);
+- the index is missing or unreadable, or the previous analysis failed while writing;
+- the embedding model, the collection or the chunking settings changed;
+- the index does not match the databases: the node, relationship and vector **counts** are
+  compared with Neo4j and Qdrant before trusting it (a collection emptied by hand is rebuilt);
+- the client asks for it: `POST /analyze?full=true`.
+
+### Background jobs (`analysis/jobs.py`, `services/analysis_service.py`)
+
+```
+POST /analyze -> AnalysisService.start()   project exists (404), no active job (409),
+                                           job saved as "queued", handed to the runner
+              <- 202 with the job           the request returns at once
+worker thread -> AnalysisService._run()    "running", progress saved as it happens,
+                                           then "ready" + result, or "failed" + safe message
+GET /analysis -> AnalysisService.get_state()   read from workspace/<id>/analysis.json
+```
+
+- **The runner** is a `ThreadPoolExecutor` with **one** thread. Analyses run one after the
+  other (they share the CPU and the embedding model); another project's job waits as
+  `queued`. No Celery, Redis or broker.
+- **Process-local, by design.** The queue and the registry of active jobs live in the API
+  process. If the server stops, queued and running jobs are lost. Their saved state says
+  `running`, but no job of this process owns it, so `GET /analysis` reports it `failed`
+  ("interrupted") and the project can be analyzed again. Several API workers would each have
+  their own queue. A larger deployment would replace `ThreadJobRunner` with a durable queue;
+  the job is a plain function and its state is already persisted.
+- **Concurrency.** One job per project: a second `POST /analyze` gets 409 while one is
+  queued or running, because two analyses would each delete what the other wrote.
+
+### Persisted state and real progress (`services/analysis_store.py`)
+
+`analysis.json` now holds `job` (job ID, status, mode, phase, `completed`, `total`, `unit`,
+timestamps, error) and `result` (the report of the analysis whose data is in the databases).
+
+| `status` | Meaning |
+| --- | --- |
+| `not_analyzed` | no job, no result |
+| `queued` / `running` | a job is waiting or working |
+| `ready` | the last job succeeded |
+| `failed` | the last job failed |
+
+`completed` and `total` are **real counts**: files parsed out of files to parse, chunks
+embedded out of chunks that need an embedding. Phases with nothing to count (`resolving`,
+`graph`...) report `null`, never an invented percentage. Counts are saved at most twice per
+second.
+
+### Failure and consistency
+
+Neo4j and Qdrant are two systems with no common transaction, so the order of the steps does
+the work:
+
+1. **Everything slow or likely to fail runs first** (connectivity checks, model loading,
+   parsing, embedding), before a single write. A failure there changes nothing: the previous
+   graph, vectors and index are intact. The state reads `failed` and **keeps the previous
+   result**, and chat keeps answering from it.
+2. **When writing starts**, the previous result is removed from the state and the index is
+   deleted. From then on the databases may hold a mix of old and new data.
+3. **A failure while writing** reads `failed` with no result. The next analysis finds no index,
+   so it is a full one, which rewrites everything and removes leftovers.
+4. `ready` is written only after both databases were updated and the new index saved.
+
+Embedding first means the vectors of the changed chunks are held in memory until they are
+written: negligible for an incremental run, larger for the first analysis of a big project.
+
+### Testing
+
+- **`tests/test_incremental_analysis.py`:**
+  - *Changes:* an unchanged project (no parse, no embedding, no write); a modified file (only
+    it is parsed, one chunk embedded, the rest reused); moved code (new line numbers, no
+    embedding); added and deleted files.
+  - *Cross-file relationships:* a deleted file, a restored file, a renamed function, and a new
+    definition that resolves a call of an unchanged file.
+  - *Equivalence:* an incremental run and a full run leave identical databases.
+  - *Idempotency and isolation:* repeated runs change nothing; projects don't affect each
+    other.
+  - *Detection:* content-based change detection; a file that cannot be parsed is remembered,
+    not retried.
+  - *Fallbacks to a full run:* no index, an unreadable index, an emptied graph or vector
+    store, another model, or a forced full run.
+  - *Failures:* before writing (previous analysis kept) and while writing (repaired by the
+    next full run).
+- **`tests/test_analysis_api.py`:** 202 with a queued job, the worker, real counts read over
+  HTTP while embedding, phase order, 409, queued projects, a real thread, failures, an
+  interrupted job, and the persisted state including the Phase 13 format.
+- **`tests/test_analysis_index.py`:** SHA-256, change detection, fingerprints, graph diff, and
+  the index save and load.
+- **Real Neo4j (opt-in):** an incremental `apply()` on real Neo4j and on the fake give the same
+  graph.
+
+## Advanced analysis (Phase 14)
+
+Three read-only endpoints built on graph retrieval (Phase 7). They are deterministic, except
+the wording of the architecture summary.
+
+```
+routes/insights.py -> InsightsService -> GraphRetrievalService -> GraphRepository -> Neo4j
+                                      -> app/analysis/insights.py       pure functions
+                                      -> app/analysis/architecture.py   facts
+                                      -> app/llm/architecture.py        LLM over the facts only
+```
+
+### Impact analysis: `GET /projects/{id}/analysis/impact?entity_id=&depth=`
+
+"What may be affected if this entity changes?"
+
+- **Traversal:** `GraphRetrievalService.get_impact()` walks **incoming** `CALLS`, `USES`,
+  `INHERITS`, `IMPLEMENTS`, `IMPORTS` and `DEPENDS_ON` relationships breadth-first, with the
+  existing `get_related()` query.
+- **Starting points:** the entity and everything it defines (changing a class changes its
+  methods).
+- **Result:** each affected entity appears once, at its smallest distance, with the
+  relationship that reaches it and the entity it references (`via`).
+- **Bounds:** `depth` 1–5 (default 3) and 300 entities, with a `truncated` flag.
+- **Isolation:** an entity ID of another project is "not found".
+- **Honest limits:** no risk score is invented. Calls the analysis could not resolve (dynamic
+  code) are not seen.
+
+### Dependency analysis: `GET /projects/{id}/analysis/dependencies`
+
+Computed in memory by `analysis/insights.py` from a bounded read of the project graph (the
+Phase 13 query with larger limits: 5,000 nodes, 20,000 relationships; `partial` says when the
+project is larger).
+
+- **File dependencies:** file A `IMPORTS` or `DEPENDS_ON` file B.
+- **Circular dependencies:**
+  - Strongly connected components are found first (Tarjan's algorithm, without recursion).
+  - In each component, the shortest cycle through every node is taken.
+  - Cycles are returned as readable paths: `[A, B, C]` means `A -> B -> C -> A`.
+  - This lists the distinct short cycles without enumerating every possible loop.
+- **Hubs:** files ranked by the number of files that depend on them; classes and functions
+  ranked by the number of entities that call, use or extend them. These are real counts.
+- **No detected references:** entities with no incoming `CALLS`, `USES`, `INHERITS` or
+  `IMPLEMENTS`. The response says explicitly that this is **not proof of dead code**: they
+  may be called dynamically, by a framework, from outside, or through an unresolved call.
+- **Files nothing depends on:** entry points, scripts, tests or unused files; the graph cannot
+  tell which.
+
+### Architecture summary: `GET /projects/{id}/analysis/architecture`
+
+1. **Facts** (`analysis/architecture.py`), each a count or a list from the graph:
+   - size per language
+   - files per directory
+   - file dependencies between directories
+   - most depended-on files, and most referenced entities
+   - possible entry points (stated as "possible; the graph cannot confirm it")
+   - largest classes
+   - relationship totals
+   - circular dependencies
+
+   Facts are numbered and keep the entities they are about.
+2. **Prompt** (`llm/architecture.py`): the facts go in the user message, XML-escaped inside
+   `<facts>`. The model never sees the repository.
+3. **Instructions:** use only the facts, cite them as `[n]`, do not name an architecture
+   pattern, a framework or a purpose the facts do not state, and say when something cannot be
+   determined.
+4. **Checks:** cited numbers that match no fact are reported as a warning. If the LLM is
+   unavailable or not configured, the facts are returned with `summary: null` and a warning. An
+   unanalyzed project has no facts, and no LLM call is made.
+
+## Frontend (Phases 12-14)
 
 React 19 + TypeScript + Vite. There's no global state library: the backend is the source of
 truth, and each page keeps its own state.
@@ -1310,18 +1564,37 @@ truth, and each page keeps its own state.
 src/
 ├── services/api.ts        every HTTP call (typed); errors -> safe messages (ApiError)
 ├── types/api.ts           mirrors the Pydantic schemas field for field
-├── hooks/useAnalysis.ts   GET /analysis on mount, POST /analyze on demand
+├── hooks/useAnalysis.ts   GET /analysis on mount, POST /analyze, polling while a job runs
 ├── pages/Home/            import (GitHub, ZIP) + project list
-├── pages/Project/         ProjectHeader, AnalysisPanel, tabs: Chat | Knowledge Graph
+├── pages/Project/         ProjectHeader, AnalysisPanel, tabs: Chat | Knowledge Graph | Insights
 └── components/
+    ├── AnalysisPanel/     job status, real progress (phase, completed/total), last report
     ├── Chat/              messages, safe Markdown, [n] citations -> sources
     ├── SourceCitation/    file, lines, found_by, cited
-    └── GraphViewer/       GraphPanel (fetch, limit, legend, filters, search),
-                           GraphCanvas (Cytoscape.js, lazy-loaded), NodeDetails, graphStyle
+    ├── GraphViewer/       GraphPanel (fetch, limit, legend, filters, search),
+    │                      GraphCanvas (Cytoscape.js, lazy-loaded), NodeDetails,
+    │                      ImpactPanel (impact analysis of the selected node), graphStyle
+    └── Insights/          dependency analysis, architecture facts and summary
 ```
 
-- **Analysis state:** `useAnalysis` reads the persisted state, so "Ready" and the counts
-  survive a reload. A failure shows "Not analyzed", as the backend does.
+- **Analysis state and progress:**
+  - `useAnalysis` reads the persisted state on mount, so "Ready", the counts and a job
+    still running survive a reload.
+  - `POST /analyze` returns at once. While the status is `queued` or `running`, the state is
+    read again every 1.5 s, and polling stops at `ready` or `failed`.
+  - The panel shows the job's phase and its real `completed / total` (a `<progress>` bar only
+    when the backend counted something, never an invented percentage).
+  - It also shows what the analysis processed: files parsed, chunks embedded, chunks reused.
+  - A failure that left the previous analysis valid says so and keeps its report.
+- **Impact analysis:** a button in the details of a selected node calls
+  `GET /analysis/impact`. Affected entities are listed by distance with the relationship that
+  reaches them, and highlighted in Cytoscape (the others are faded). Entities outside the
+  displayed graph are listed, not drawn.
+- **Insights tab:**
+  - The dependency analysis loads when the tab opens: cycles as paths, hubs with counts, and
+    "no detected references" with the backend's warning that it is not proof of dead code.
+  - The architecture summary is generated only on request (it calls the LLM). Its `[n]`
+    citations link to the numbered facts.
 - **Graph viewer:** Cytoscape.js does the force-directed layout (non-random, so the same graph
   looks the same), zoom, pan and selection. React owns the data: graph, selection and hidden
   relationship types.
@@ -1329,8 +1602,8 @@ src/
     chunk.
   - A `ResizeObserver` keeps its canvas the size of its container.
   - A new node limit or a new analysis remounts the view, which loads the graph again.
-- **Tabs:** Chat and Knowledge Graph stay mounted once opened, so switching keeps the chat
-  history and the drawn graph.
+- **Tabs:** Chat, Knowledge Graph and Insights stay mounted once opened, so switching keeps
+  the chat history, the drawn graph and the insights.
 - **Tests:** Vitest, Testing Library and jsdom, with a fake backend that replaces `fetch`. In
   jsdom (no canvas), `GraphCanvas` is replaced by a list of the nodes it receives, and the
   conversion to Cytoscape elements is tested directly.

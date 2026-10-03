@@ -7,7 +7,7 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 13 — Knowledge graph visualization. Projects can be imported from GitHub or a ZIP file,
+> **Status:** Phase 14 — Incremental background analysis and advanced analysis. Projects can be imported from GitHub or a ZIP file,
 > their source files are parsed, the files, classes, interfaces, functions and methods they
 > define are extracted, the relationships between them (imports, inheritance, calls, type uses,
 > file dependencies) are resolved, the result is stored as a knowledge graph in Neo4j that can
@@ -95,8 +95,11 @@ pytest -m llm        # calls the real LLM (needs LLM_API_KEY; free with a free-t
 | `GET`    | `/projects/{id}`       | Project details and per-language file counts |
 | `GET`    | `/projects/{id}/files` | Detected source files                        |
 | `DELETE` | `/projects/{id}`       | Delete a project and its files               |
-| `POST`   | `/projects/{id}/analyze` | Build the graph and vector index: see [Analyze, then chat](#analyze-then-chat-api) |
-| `GET`    | `/projects/{id}/analysis` | Analysis state: see [Analysis state and knowledge graph](#analysis-state-and-knowledge-graph-api) |
+| `POST`   | `/projects/{id}/analyze` | Start the analysis (background job, 202): see [Analyze, then chat](#analyze-then-chat-api) |
+| `GET`    | `/projects/{id}/analysis` | Analysis state and progress: same section |
+| `GET`    | `/projects/{id}/analysis/impact` | Impact of a change: see [Advanced analysis](#advanced-analysis-api) |
+| `GET`    | `/projects/{id}/analysis/dependencies` | Dependencies, cycles, hubs: same section |
+| `GET`    | `/projects/{id}/analysis/architecture` | Architecture facts and summary: same section |
 | `GET`    | `/projects/{id}/graph` | Bounded knowledge graph: same section |
 | `POST`   | `/projects/{id}/chat`  | Ask a question: see [Chat API](#chat-api)    |
 
@@ -513,72 +516,123 @@ free-tier key).
 
 ### Analyze, then chat (API)
 
-Three calls take a project from source code to answers, with no Python snippet:
+Three steps take a project from source code to answers, with no Python snippet:
 
 1. **Import** (`POST /projects/zip` or `/projects/github`) stores the source code. Nothing is
    analyzed yet.
-2. **Analyze** (`POST /projects/{id}/analyze`, no body) builds the Neo4j knowledge graph
-   (Phases 3–6) and the Qdrant vector index with BGE-M3 (Phase 8), by calling the same
-   `GraphService` and `VectorIndexService` shown above.
+2. **Analyze** (`POST /projects/{id}/analyze`, no body) starts a **background job** and
+   returns at once (202). The job builds or updates the Neo4j knowledge graph and the Qdrant
+   vector index; follow it with `GET /projects/{id}/analysis`.
 3. **Chat** (`POST /projects/{id}/chat`) queries both indexes through GraphRAG (see
    [Chat API](#chat-api)).
 
 ```bash
 curl -X POST http://localhost:8000/projects/zip -F "file=@my-project.zip"   # -> "id"
-curl -X POST http://localhost:8000/projects/<project_id>/analyze
+curl -X POST http://localhost:8000/projects/<project_id>/analyze            # -> 202, queued
+curl http://localhost:8000/projects/<project_id>/analysis                   # poll until "ready"
 curl -X POST http://localhost:8000/projects/<project_id>/chat \
      -H "Content-Type: application/json" \
      -d '{"question": "How is authentication implemented?"}'
 ```
 
+While the job runs, `GET /analysis` reports its real progress:
+
 ```json
 {
-  "project_id": "449fc24fe9744306bf10670bd9a7bfac",
-  "status": "ready",
-  "graph": {"files": 4, "entities": 17, "relationships": 26,
-            "entities_by_type": {"Class": 4, "File": 4, "Function": 2, "Method": 7},
-            "relationships_by_type": {"CALLS": 8, "CONTAINS": 13, "DEPENDS_ON": 2, "IMPORTS": 2, "INHERITS": 1},
-            "unresolved_references": 8, "stale_entities_removed": 0},
-  "vectors": {"files": 4, "chunks": 15, "chunks_by_type": {"class": 4, "file": 2, "function": 2, "method": 7},
-              "embedding_model": "BAAI/bge-m3", "stale_chunks_removed": 0},
-  "failed_files": 0,
-  "warnings": [],
-  "duration_seconds": 6.951,
-  "analyzed_at": "2026-10-02T18:30:00Z"
+  "project_id": "551cf56161504b1b8815bf54892d9088",
+  "status": "running",
+  "job": {"job_id": "…", "status": "running", "mode": "full", "phase": "embedding",
+          "completed": 96, "total": 378, "unit": "chunks",
+          "queued_at": "…", "started_at": "…", "finished_at": null, "error": null},
+  "analysis": null
 }
 ```
 
-- `status` is `ready` only when both the graph and the vector index were built. Any failure
-  returns an error instead: 404 unknown project, 409 already being analyzed, 503 Neo4j,
-  Qdrant or the embedding model unavailable.
-- **Analyze again** after the code changes: both steps are idempotent, so nothing is
-  duplicated and removed code is cleaned up (`stale_*_removed`).
-- **Synchronous:** the request returns when analysis is done. Almost all of the time is
-  embedding: building the graph of a 69-file project takes about 1 s. Measured on an Intel
-  i5-12450H CPU for that project (378 chunks):
-  - **BGE-M3** (the default): about 3.1 s per chunk, so about 20 minutes.
-  - **`BAAI/bge-base-en-v1.5`:** 4.7 minutes end to end. It is English-only, with 768
-    dimensions and 512 tokens.
-  - **To switch:** set `EMBEDDING_MODEL` and a new `QDRANT_COLLECTION` in `backend/.env`, see
-    "Changing the embedding model".
-  - Loading the model adds 10–30 s to the first call, and re-analysis embeds every chunk
-    again.
-- If indexing fails after the graph was built, the graph is kept and any previous vectors are
-  untouched: analyze again to complete it.
+and once it is `ready`, the report of the analysis (here, after one file was edited):
+
+```json
+{
+  "status": "ready",
+  "job": {"status": "ready", "mode": "incremental", "phase": "finalizing", "…": "…"},
+  "analysis": {
+    "status": "ready", "mode": "incremental",
+    "graph": {"files": 68, "entities": 367, "relationships": 1005, "…": "…"},
+    "vectors": {"files": 68, "chunks": 368, "embedding_model": "BAAI/bge-base-en-v1.5", "…": "…"},
+    "changes": {"files_added": 0, "files_modified": 1, "files_unchanged": 67, "files_deleted": 0,
+                "files_parsed": 1, "chunks_embedded": 1, "chunks_reused": 367,
+                "chunks_updated": 0, "chunks_deleted": 0, "…": "…"},
+    "failed_files": 0, "warnings": [], "duration_seconds": 0.592,
+    "analyzed_at": "2026-10-03T14:17:02Z"
+  }
+}
+```
+
+**Incremental analysis.** The first analysis processes everything. Later ones only process
+what changed:
+
+- **Change detection:** every source file is hashed (SHA-256 of its content) and compared with
+  the previous analysis. Each file is added, modified, unchanged or deleted; dates are not
+  used.
+- **Parsing:** only added and modified files are parsed. Relationships are then resolved
+  again over the whole project from cached results, so a call to a function that was deleted
+  or renamed in another file is updated too.
+- **Graph:** only the nodes and relationships that differ are written to Neo4j, and those
+  that no longer exist are deleted.
+- **Embeddings:** each chunk has a content hash. Unchanged chunks keep their vector in
+  Qdrant; only new or changed chunks are embedded. Code that only moved to other lines gets
+  its metadata updated, with no new embedding. Chunks of deleted code are removed.
+- **Full analysis instead:** it happens automatically when there is no previous analysis, when
+  the embedding model or chunking settings changed, or when the saved index does not match the
+  databases. `POST /analyze?full=true` forces one.
+
+Measured on a real 68-file project (Python and JavaScript, 368 chunks) with
+`BAAI/bge-base-en-v1.5` on an Intel i5-12450H CPU, the model already loaded:
+
+| Analysis | Files parsed | Embeddings generated | Vectors reused | Time |
+| --- | --- | --- | --- | --- |
+| Full | 68 | 368 | 0 | 136.1 s |
+| One function edited | 1 | 1 | 367 | 0.59 s |
+| Two blank lines added at the top of a file | 1 | 0 (7 metadata updates) | 368 | 0.81 s |
+| Nothing changed | 0 | 0 | 368 | 0.35 s |
+
+Embedding is almost all of the time of a full analysis, and it depends on the model: BGE-M3
+(the default) needs about 3.1 s per chunk on that CPU, against about 0.4 s for bge-base in this
+run; see "Changing the embedding model". The first job after a server start also loads the
+model (about 20 s here).
+
+On Windows, keep `QDRANT_URL=http://127.0.0.1:6333` (the default): with `localhost`, every
+request to Qdrant waited about 2 s here (IPv6 is tried first), which made a similar small
+re-analysis (2 chunks embedded) take 19.8 s.
+
+**Status and failures.**
+
+- **Statuses:** `status` is `not_analyzed`, `queued`, `running`, `ready` or `failed`.
+- **Progress:** `job.completed` and `job.total` count real work (files parsed, chunks
+  embedded). Phases with nothing to count report `null`, never an invented percentage.
+- **One analysis per project at a time:** a second `POST /analyze` gets 409. Other projects
+  wait in the queue.
+- **A failed job never says ready:**
+  - Parsing and embedding run before anything is written. If the job fails there, the
+    previous analysis stays valid, `analysis` still holds its report, and chat keeps working.
+  - If it fails while writing, `analysis` is `null` and the next analysis is a full one,
+    which repairs the databases.
+- **The worker runs inside the API process:** a server restart interrupts a running job. It
+  is then reported `failed` ("interrupted") and can be started again. With `uvicorn --reload`,
+  editing a backend file restarts the server.
 
 ### Analysis state and knowledge graph (API)
 
 | Method | Endpoint | Returns |
 | --- | --- | --- |
-| `GET` | `/projects/{id}/analysis` | `status` (`not_analyzed` or `ready`) and the report of the last successful analysis |
+| `GET` | `/projects/{id}/analysis` | `status`, the current or last job with its progress, and the report of the last successful analysis |
 | `GET` | `/projects/{id}/graph?limit=150` | a bounded view of the project's Neo4j graph: nodes, edges, `truncated`, totals |
 
-**Analysis state.** A successful `POST /analyze` saves its report (the same counts, warnings
-and `analyzed_at`) in `backend/workspace/<id>/analysis.json`, next to `project.json`. So
-`GET /analysis` answers after a reload or a server restart, without querying any database. The
-file is removed when an analysis starts and written only once both steps succeeded: after a
-failed or interrupted analysis the project reads `not_analyzed`. Projects analyzed before this
-file existed also read `not_analyzed` until they are analyzed again.
+**Analysis state.** The job, its progress and the report of the last successful analysis are
+saved in `backend/workspace/<id>/analysis.json`, next to `project.json`. So `GET /analysis`
+answers after a reload or a server restart, without querying any database (see
+[Analyze, then chat](#analyze-then-chat-api) for the statuses). What the next incremental
+analysis needs (file hashes, per-file results, fingerprints) is in `analysis_index.json`
+beside it.
 
 **Graph.** `GET /graph` returns up to `limit` nodes (1–500, default 150) and up to 2,000
 relationships between those nodes. Nodes come in a fixed order, structure first (files, then
@@ -606,6 +660,56 @@ project always gives the same graph. `truncated: true` says the project has more
   and no Cypher, label or relationship type can be passed.
 - **Errors:** 404 unknown project, 422 invalid `limit`, 503 Neo4j unavailable. An unanalyzed
   project returns an empty graph.
+
+### Advanced analysis (API)
+
+Three read-only analyses of the knowledge graph. The first two are computed from the graph
+with no LLM.
+
+| Method | Endpoint | Returns |
+| --- | --- | --- |
+| `GET` | `/projects/{id}/analysis/impact?entity_id=…&depth=3` | entities that may be affected if this one changes, by distance |
+| `GET` | `/projects/{id}/analysis/dependencies` | file dependencies, circular dependencies, hubs, entities with no detected reference |
+| `GET` | `/projects/{id}/analysis/architecture` | numbered facts computed from the graph, and an LLM summary of them |
+
+**Impact analysis.** From a node of the graph (`entity_id`, as returned by `GET /graph`), it
+follows who calls, uses, extends or imports it, then who references those, up to `depth`
+steps (1–5):
+
+```json
+{"entity": {"qualified_name": "verify_password", "file_path": "backend/core/security.py", "…": "…"},
+ "affected": [
+   {"entity": {"qualified_name": "authenticate_user", "…": "…"}, "depth": 1,
+    "relationship_type": "CALLS", "via": "…:backend/core/security.py:verify_password"},
+   {"entity": {"qualified_name": "login", "…": "…"}, "depth": 2,
+    "relationship_type": "CALLS", "via": "…:backend/database/crud.py:authenticate_user"}],
+ "total": 2, "by_depth": {"1": 1, "2": 1}, "max_depth": 3, "truncated": false}
+```
+
+Each entity appears once, at its smallest distance, with the relationship that reaches it. No
+risk score is invented, and calls the analysis could not resolve (dynamic code) are not seen.
+
+**Dependency analysis.** A file depends on another when it imports it, or when its code
+calls, uses or extends code of it. The response gives:
+
+- the dependencies;
+- the **circular dependencies** as readable paths (`["a.py", "b.py", "c.py"]` means
+  a → b → c → a);
+- the files and entities most depended on, with real counts;
+- the entities with **no detected reference**, which come with a note that this is not proof
+  of dead code: they may be called dynamically, by a framework or from outside.
+
+**Architecture summary.**
+
+- **Facts:** computed from the graph first. They cover size per language, files per
+  directory, dependencies between directories, hubs, possible entry points, largest classes
+  and circular dependencies.
+- **Summary:** the LLM only receives these numbered facts, never the repository. It must cite
+  them as `[n]`, and is told not to name a pattern or framework the facts do not state.
+- **If the LLM is unavailable:** the facts are returned with `summary: null` and a warning.
+
+Errors: 404 unknown project or entity, 422 invalid `depth` or missing `entity_id`, 503 Neo4j
+unavailable.
 
 ### Chat API
 
@@ -673,10 +777,13 @@ Open <http://localhost:5173> (the backend must be running on port 8000).
 - **Home (`/`):** import from a GitHub URL or a ZIP upload, and the list of imported projects.
 - **Project (`/projects/:id`):**
   - The project's metadata.
-  - The **Analysis** panel. Its state comes from `GET /analysis`, so "Ready" and the counts
-    survive a reload. **Analyze Project** or **Analyze again** runs `POST /analyze`; there is no
-    fake progress bar.
-  - Two tabs, Chat and Knowledge Graph (below).
+  - The **Analysis** panel. Its state comes from `GET /analysis`, so "Ready", the counts
+    and a job still running survive a reload. **Analyze Project** or **Analyze again** starts
+    the background job. The panel then shows its phase and real counts
+    ("Embedding changed code 96 / 378 chunks"), and afterwards what was processed
+    ("1 of 68 files parsed; 1 chunk embedded, 367 reused"). **Full re-analysis** forces
+    everything to be processed again.
+  - Three tabs: Chat, Knowledge Graph and Insights (below).
 - **Chat:**
   - Markdown answers rendered safely (no raw HTML, no images, no `javascript:` links).
   - `[n]` citations are buttons that highlight the matching source (file and lines).
@@ -689,7 +796,15 @@ Open <http://localhost:5173> (the backend must be running on port 8000).
   - **Find a node** by name.
   - Clicking a node shows its type, qualified name, file, lines and language, plus its
     incoming and outgoing relationships; each one can be followed to the other node.
+  - **Impact analysis** on the selected node lists what may be affected by distance and
+    highlights those nodes in the graph.
   - A truncated graph says so, with the totals, and the node limit can be raised up to 500.
+
+- **Insights:**
+  - The dependency analysis: circular dependencies as paths, hubs with their counts, and
+    entities with no detected reference, with the note that this is not proof of dead code.
+  - The architecture summary, generated on request. Its `[n]` citations link to the computed
+    facts shown below it.
 
 All HTTP calls are in `src/services/api.ts`, typed by `src/types/api.ts`, which mirrors the
 backend's Pydantic schemas.
@@ -787,9 +902,15 @@ Imported code is treated as untrusted input:
 - **GraphRAG** only combines the typed operations above (no Cypher or Qdrant filter of its own),
   keeps every result in the requested project, expands one hop per seed with bounded paths, and
   never calls an external service.
-- **Analysis API:** `POST /projects/{id}/analyze` takes no body, only a validated project ID:
-  the client cannot pass a path, Cypher, a filter or a model. The code is parsed, never run;
-  Neo4j queries stay parameterized and every node and vector carries its project ID.
+- **Analysis API:** `POST /projects/{id}/analyze` takes no body, only a validated project ID
+  and a `full` flag: the client cannot pass a path, Cypher, a filter or a model. The code is
+  parsed, never run; Neo4j queries stay parameterized and every node and vector carries its
+  project ID. Incremental deletions find nodes, relationships and vectors by ID inside the
+  project only. A failed job reports a safe message, never an exception's text.
+- **Advanced analysis:** read-only and bounded (impact: depth ≤ 5 and 300 entities;
+  dependencies and architecture: 5,000 nodes and 20,000 relationships). The client can pass an
+  entity ID and a depth, nothing else; an entity of another project is "not found". The
+  architecture summary sends the LLM computed facts only, XML-escaped, never source code.
 - **Graph API:** `GET /projects/{id}/graph` is read-only and bounded (≤ 500 nodes, ≤ 2,000
   relationships). It runs one fixed, parameterized query filtered by `project_id`; the client
   can only choose the node limit (validated), never Cypher, labels or relationship types.
@@ -826,6 +947,9 @@ Imported code is treated as untrusted input:
 11. ✅ Chat API (`POST /projects/{id}/analyze`, `POST /projects/{id}/chat`)
 12. ✅ Frontend (import, analysis, chat with citations)
 13. ✅ Graph visualization (persisted analysis state, `GET /projects/{id}/graph`, Cytoscape.js)
-14. Advanced analysis (impact, dependencies, architecture summary)
+14. ✅ Advanced analysis (impact, dependencies, architecture summary) and incremental
+    background analysis (SHA-256 change detection, embedding reuse, real progress)
 15. Testing (integration, retrieval, end-to-end)
-16. Docker & finalization
+
+The application itself is not containerized: Docker is only used to run Neo4j and Qdrant
+locally (`docker-compose.yml`).

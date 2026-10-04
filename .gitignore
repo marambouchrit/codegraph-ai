@@ -33,3 +33,7 @@ data/
 .idea/
 .DS_Store
 Thumbs.db
+
+# --- Playwright (frontend/e2e) ---
+test-results/
+playwright-report/

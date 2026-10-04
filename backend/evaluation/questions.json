@@ -1,0 +1,189 @@
+{
+  "repository": "https://github.com/marambouchrit/behave-ai-assistant",
+  "commit": "46e001af27e2bf788fea6c152d4455b1f80c67a8",
+  "note": "Labelled by hand from the source code, before any retrieval was run. An expected item is \"<file path>::<qualified name>\" (one entity) or \"<file path>\" (any entity of that file).",
+  "questions": [
+    {
+      "id": 1,
+      "category": "lookup",
+      "question": "Where are passwords hashed and verified?",
+      "expected": [
+        "backend/core/security.py::hash_password",
+        "backend/core/security.py::verify_password"
+      ]
+    },
+    {
+      "id": 2,
+      "category": "lookup",
+      "question": "How is a JWT access token created and decoded?",
+      "expected": [
+        "backend/core/security.py::create_access_token",
+        "backend/core/security.py::decode_token"
+      ]
+    },
+    {
+      "id": 3,
+      "category": "lookup",
+      "question": "Which class stores document embeddings and searches the vector database?",
+      "expected": [
+        "ingestion/embedder.py::BeHaveVectorStore",
+        "ingestion/embedder.py::BeHaveVectorStore.search"
+      ]
+    },
+    {
+      "id": 4,
+      "category": "callers",
+      "question": "Which function calls verify_password?",
+      "expected": [
+        "backend/database/crud.py::authenticate_user"
+      ]
+    },
+    {
+      "id": 5,
+      "category": "callees",
+      "question": "What does the login endpoint call to check the credentials and issue a token?",
+      "expected": [
+        "backend/database/crud.py::authenticate_user",
+        "backend/core/security.py::create_access_token"
+      ]
+    },
+    {
+      "id": 6,
+      "category": "callees",
+      "question": "What does the chat endpoint call to answer a question and save the exchange?",
+      "expected": [
+        "rag/chain.py::BeHaveRAGChain.ask",
+        "backend/database/crud.py::save_conversation",
+        "backend/database/crud.py::get_recent_chat_conversations",
+        "backend/main.py::_get_owned_chat_or_404"
+      ]
+    },
+    {
+      "id": 7,
+      "category": "callers",
+      "question": "Which code calls build_chunks?",
+      "expected": [
+        "backend/services/document_service.py::index_document",
+        "ingestion/run_indexation.py::run_indexation"
+      ]
+    },
+    {
+      "id": 8,
+      "category": "dependencies",
+      "question": "What does the RAG chain depend on to retrieve and rank document chunks?",
+      "expected": [
+        "rag/retriever.py::BeHaveRetriever.retrieve",
+        "rag/reranker.py::Reranker.rerank",
+        "ingestion/embedder.py::BeHaveVectorStore.search"
+      ]
+    },
+    {
+      "id": 9,
+      "category": "dependencies",
+      "question": "Which frontend service modules send their requests through the shared HTTP helper?",
+      "expected": [
+        "frontend/src/services/api.js",
+        "frontend/src/services/authApi.js",
+        "frontend/src/services/adminApi.js"
+      ]
+    },
+    {
+      "id": 10,
+      "category": "workflow",
+      "question": "How is authentication implemented in the backend?",
+      "expected": [
+        "backend/routers/auth.py::login",
+        "backend/database/crud.py::authenticate_user",
+        "backend/core/security.py::create_access_token",
+        "backend/core/dependencies.py::require_user_token"
+      ]
+    },
+    {
+      "id": 11,
+      "category": "workflow",
+      "question": "How are admin-only routes protected?",
+      "expected": [
+        "backend/core/dependencies.py::require_admin_user",
+        "backend/core/dependencies.py::require_user_token"
+      ]
+    },
+    {
+      "id": 12,
+      "category": "workflow",
+      "question": "How does the frontend keep the user logged in and react to an expired session?",
+      "expected": [
+        "frontend/src/context/AuthContext.jsx::AuthProvider",
+        "frontend/src/services/http.js::setUnauthorizedHandler",
+        "frontend/src/services/authApi.js::fetchCurrentUser"
+      ]
+    },
+    {
+      "id": 13,
+      "category": "workflow",
+      "question": "How is the login endpoint protected against brute-force attempts?",
+      "expected": [
+        "backend/core/rate_limit.py::install_rate_limiting",
+        "backend/core/rate_limit.py::_rate_limit_exceeded",
+        "backend/routers/auth.py::login"
+      ]
+    },
+    {
+      "id": 14,
+      "category": "cross-file",
+      "question": "What happens from the browser to the database when a user sends a chat message?",
+      "expected": [
+        "frontend/src/components/ChatWindow.jsx::ChatWindow.handleSend",
+        "frontend/src/services/api.js::sendMessage",
+        "backend/main.py::chat",
+        "rag/chain.py::BeHaveRAGChain.ask",
+        "backend/database/crud.py::save_conversation"
+      ]
+    },
+    {
+      "id": 15,
+      "category": "cross-file",
+      "question": "How does a document uploaded by an admin become searchable chunks?",
+      "expected": [
+        "backend/routers/admin_documents.py::upload_document",
+        "backend/services/document_service.py::index_document",
+        "ingestion/pipeline.py::build_chunks",
+        "ingestion/chunker.py::chunk_segments",
+        "ingestion/embedder.py::BeHaveVectorStore.add_documents"
+      ]
+    },
+    {
+      "id": 16,
+      "category": "cross-file",
+      "question": "How does resetting a chat hide its messages?",
+      "expected": [
+        "frontend/src/components/ChatWindow.jsx::ChatWindow.handleReset",
+        "frontend/src/services/api.js::resetChat",
+        "backend/main.py::reset_chat_messages",
+        "backend/database/crud.py::hide_chat_conversations"
+      ]
+    },
+    {
+      "id": 17,
+      "category": "architecture",
+      "question": "What are the main stages of the document ingestion pipeline?",
+      "expected": [
+        "ingestion/run_indexation.py::run_indexation",
+        "ingestion/document_loader.py::load_document",
+        "ingestion/chunker.py::chunk_segments",
+        "ingestion/pipeline.py::build_chunks",
+        "ingestion/embedder.py::BeHaveVectorStore.add_documents"
+      ]
+    },
+    {
+      "id": 18,
+      "category": "architecture",
+      "question": "How is the frontend routing organized between public, user and admin pages?",
+      "expected": [
+        "frontend/src/App.jsx::App",
+        "frontend/src/App.jsx::PublicRoute",
+        "frontend/src/App.jsx::ProtectedUserRoute",
+        "frontend/src/App.jsx::ProtectedAdminRoute"
+      ]
+    }
+  ]
+}

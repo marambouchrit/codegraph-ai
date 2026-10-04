@@ -7,7 +7,7 @@ Tree-sitter, builds a knowledge graph of files, classes, functions and their rel
 Neo4j, indexes the code semantically in Qdrant, and answers natural-language questions about the
 project — with answers grounded in the code and linked to source locations.
 
-> **Status:** Phase 14 — Incremental background analysis and advanced analysis. Projects can be imported from GitHub or a ZIP file,
+> **Status:** all 15 phases are complete (the last one: testing and a retrieval evaluation). Projects can be imported from GitHub or a ZIP file,
 > their source files are parsed, the files, classes, interfaces, functions and methods they
 > define are extracted, the relationships between them (imports, inheritance, calls, type uses,
 > file dependencies) are resolved, the result is stored as a knowledge graph in Neo4j that can
@@ -37,8 +37,9 @@ See [docs/architecture.md](docs/architecture.md) for the full architecture.
 codegraph-ai/
 ├── backend/          # FastAPI application
 │   ├── app/          # application code
+│   ├── evaluation/   # retrieval evaluation (labelled questions, script, results)
 │   └── tests/        # pytest tests
-├── frontend/         # React + TypeScript + Vite application
+├── frontend/         # React + TypeScript + Vite application (e2e/: browser test)
 ├── docs/             # documentation
 └── docker-compose.yml  # local Neo4j and Qdrant
 ```
@@ -812,6 +813,67 @@ backend's Pydantic schemas.
 Scripts: `npm run dev`, `npm run build`, `npm run lint`, `npm run typecheck`, `npm test`
 (Vitest + Testing Library, with a fake backend: no server needed).
 
+## Testing and evaluation
+
+### Tests
+
+| Suite | Command | Needs | Result (final run) |
+| --- | --- | --- | --- |
+| Backend, offline | `pytest` (from `backend/`) | nothing | 783 passed, 2 skipped |
+| Backend, real stack | `pytest -m "network or neo4j or qdrant or embeddings or llm"` | internet, Neo4j, Qdrant, the embedding model, `LLM_API_KEY` | 17 passed |
+| Frontend | `npm test` (from `frontend/`) | nothing | 83 passed |
+| Frontend lint and build | `npm run lint`, `npm run build` | nothing | clean |
+| Browser end-to-end | `npm run e2e` (from `frontend/`) | see below | 1 passed (14 steps) |
+
+The browser test (`frontend/e2e/workflow.e2e.ts`, Playwright) drives the real application:
+import a 4-file ZIP, analyze it, ask a question (answer, sources and citations), open the
+knowledge graph, select a node, run the impact analysis, open the dependency analysis and
+generate the architecture summary. Prerequisites: `docker compose up -d neo4j qdrant`, the
+backend running on port 8000 with `LLM_API_KEY` set, and Microsoft Edge installed (the test
+uses the installed browser and starts the Vite server itself). Each run leaves the small
+project's graph and vectors in the databases: deleting a project removes its source code only.
+
+### Retrieval evaluation
+
+Does GraphRAG retrieve the relevant code better than vector search alone? A small evaluation,
+in `backend/evaluation/`:
+
+- **Questions:** 18, labelled by hand from the source code before any retrieval was run
+  (`questions.json`): lookups, callers and callees, dependencies, workflows, cross-file
+  questions and architecture. Each lists the entities a good retrieval should find.
+- **Repository:** one, [behave-ai-assistant](https://github.com/marambouchrit/behave-ai-assistant)
+  at commit `46e001a` (69 Python and JavaScript files, 377 graph nodes, 1,048 relationships).
+- **Embedding model:** `BAAI/bge-base-en-v1.5` for both methods.
+- **Recall@K:** the share of a question's expected entities that were retrieved, averaged over
+  the questions. Vector-only is its top K chunks. GraphRAG is the sources built from those same
+  K chunks expanded in the graph, which is what the chat gives to the LLM.
+
+| | Recall@5 | Sources | Recall@10 | Sources |
+| --- | --- | --- | --- | --- |
+| Vector-only | 50.5% | 5.0 | 61.7% | 9.7 |
+| GraphRAG | 79.8% | 19.8 | 84.4% | 22.6 |
+
+On this set, GraphRAG retrieved more of the expected entities than vector search alone. It was
+better on 9 of the 18 questions at K=5, equal on the other 9 and never worse (it always
+contains the vector hits). The gain is on questions about callers, callees and code spread
+over several files; simple lookups were already found by vector search.
+
+Limitations:
+
+- GraphRAG retrieves about twice to four times as many sources, so part of the gain comes
+  from a larger context; vector search with 10 chunks (61.7%) is still below GraphRAG built
+  from 5 (79.8%).
+- 18 questions on one repository, labelled by one person: an indication, not a general result.
+- It measures retrieval only: not the quality or correctness of the LLM's answers, not its
+  citations, not speed.
+
+Run it (Neo4j and Qdrant started, the repository imported and analyzed):
+
+```bash
+cd backend
+python -m evaluation.retrieval_eval <project_id>   # prints the table, writes results.json
+```
+
 ## Configuration
 
 Configuration is read from environment variables / `.env` files. Real `.env` files are ignored by
@@ -949,7 +1011,7 @@ Imported code is treated as untrusted input:
 13. ✅ Graph visualization (persisted analysis state, `GET /projects/{id}/graph`, Cytoscape.js)
 14. ✅ Advanced analysis (impact, dependencies, architecture summary) and incremental
     background analysis (SHA-256 change detection, embedding reuse, real progress)
-15. Testing (integration, retrieval, end-to-end)
+15. ✅ Testing and evaluation (retrieval evaluation, browser end-to-end test, final regression)
 
 The application itself is not containerized: Docker is only used to run Neo4j and Qdrant
 locally (`docker-compose.yml`).

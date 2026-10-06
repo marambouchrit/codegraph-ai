@@ -1,9 +1,10 @@
 """The chat workflow: a question about a project -> a grounded, cited answer.
 
-    ChatService (this module)   the order of the steps, nothing else
+    ChatService (this module)   checks the request, then runs the workflow
         ├── ProjectService          does the project exist?          (Phase 2)
-        ├── GraphRAGService         retrieval: Qdrant + Neo4j          (Phase 9)
-        └── LLMGenerationService    generation: prompt + LLM           (Phase 10)
+        └── chat workflow           a LangGraph state graph (chat_workflow.py):
+            ├── GraphRAGService         retrieval: Qdrant + Neo4j      (Phase 9)
+            └── LLMGenerationService    generation: prompt + LLM       (Phase 10)
 
 No Cypher, no Qdrant call, no embedding, no prompt, no provider SDK here: each belongs
 to the layer above. The two heavy services are given as factories (called only when
@@ -16,20 +17,13 @@ Nothing is re-indexed: the project must have been analyzed (graph) and indexed
 
 import logging
 from collections.abc import Callable
-from typing import Protocol
 
-from app.graphrag.models import GraphRAGContext
 from app.llm.generator import LLMGenerationService
 from app.llm.models import AssistantResponse
+from app.services.chat_workflow import ContextRetriever, build_chat_workflow
 from app.services.project_service import ProjectService
 
 logger = logging.getLogger(__name__)
-
-
-class ContextRetriever(Protocol):
-    """What the chat needs from GraphRAGService."""
-
-    def build_context(self, project_id: str, query: str) -> GraphRAGContext: ...
 
 
 class ChatService:
@@ -40,15 +34,15 @@ class ChatService:
         generator: Callable[[], LLMGenerationService],
     ) -> None:
         self.project_service = project_service
-        self._graphrag = graphrag
         self._generator = generator
+        self._workflow = build_chat_workflow(graphrag, generator)
 
     def ask(self, project_id: str, question: str) -> AssistantResponse:
         """Answer `question` about the project (ProjectNotFoundError if unknown)."""
         self.project_service.get_project(project_id)  # invalid or unknown ID: 404, first
-        generator = self._generator()  # LLM misconfigured: fail before retrieval
-        context = self._graphrag().build_context(project_id, question)  # one retrieval
-        response = generator.generate(context)
+        self._generator()  # LLM misconfigured: fail before retrieval
+        state = self._workflow.invoke({"project_id": project_id, "question": question})
+        response: AssistantResponse = state["response"]
         logger.info("Chat on project %s: %d sources, graph %s, model %s", project_id,
                     len(response.sources), response.graph_status, response.model)  # fmt: skip
         return response

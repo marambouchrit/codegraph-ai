@@ -275,6 +275,28 @@ def test_graph_status_warnings_and_truncation_reach_the_response(
     assert "output limit" in response.warnings[1]
 
 
+
+def test_an_answer_saying_the_context_is_insufficient_gets_a_warning(
+    context: GraphRAGContext,
+) -> None:
+    answer = "The available repository context is insufficient: nothing here handles payments."
+
+    response = LLMGenerationService(FakeLLM(answer)).generate(context)
+
+    assert response.answer == answer and response.model == "fake/model"
+    assert response.warnings == (
+        "The retrieved code did not contain what this question needs: the answer may be "
+        "incomplete.",
+    )
+
+
+def test_a_normal_answer_that_mentions_insufficient_context_later_gets_no_warning(
+    context: GraphRAGContext,
+) -> None:
+    answer = "`login` checks the password [1]. The available repository context is insufficient for X."
+
+    assert LLMGenerationService(FakeLLM(answer)).generate(context).warnings == ()
+
 # ----- Provider factory (settings) -----
 
 

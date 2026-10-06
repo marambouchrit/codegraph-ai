@@ -21,7 +21,7 @@ import logging
 import re
 
 from app.graphrag.models import GraphRAGContext
-from app.llm.models import AssistantResponse, NumberedSource
+from app.llm.models import AssistantResponse, LLMCompletion, NumberedSource, Prompt
 from app.llm.prompts import PromptBuilder
 from app.llm.provider import LLMProvider
 
@@ -30,9 +30,13 @@ logger = logging.getLogger(__name__)
 # "[1]", "[2][3]" and "[2, 3]" all cite sources.
 CITATION = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
+# The system prompt asks the model to start with these words when the context does not answer
+# the question (prompts.py, rule 2).
+INSUFFICIENT = "The available repository context is insufficient"
+
 NOTHING_RETRIEVED = (
-    "The available repository context is insufficient to answer this question: no code "
-    "related to it was found in the indexed project."
+    f"{INSUFFICIENT} to answer this question: no code related to it was found in the "
+    "indexed project."
 )
 
 
@@ -42,24 +46,41 @@ class LLMGenerationService:
         self.prompt_builder = prompt_builder or PromptBuilder()
 
     def generate(self, context: GraphRAGContext) -> AssistantResponse:
-        """A grounded answer to `context.query`, from `context` only."""
-        warnings = list(context.warnings)
-        if not context.vector_results:
-            warnings.append("Nothing relevant was retrieved, so no LLM was called.")
-            return AssistantResponse(
-                question=context.query, answer=NOTHING_RETRIEVED, sources=(), cited=(),
-                graph_status=context.graph_status, warnings=tuple(warnings), model=None,
-            )  # fmt: skip
+        """A grounded answer to `context.query`, from `context` only.
 
+        The chat runs the same steps as separate nodes of its workflow
+        (app/services/chat_workflow.py).
+        """
+        if not context.vector_results:
+            return self.nothing_retrieved(context)
         prompt = self.prompt_builder.build(context)
         completion = self.provider.generate(prompt.system, prompt.user)
+        return self.respond(context, prompt, completion)
 
+    def nothing_retrieved(self, context: GraphRAGContext) -> AssistantResponse:
+        """The answer when no code was retrieved: no model is called."""
+        warnings = (*context.warnings, "Nothing relevant was retrieved, so no LLM was called.")
+        return AssistantResponse(
+            question=context.query, answer=NOTHING_RETRIEVED, sources=(), cited=(),
+            graph_status=context.graph_status, warnings=warnings, model=None,
+        )  # fmt: skip
+
+    def respond(
+        self, context: GraphRAGContext, prompt: Prompt, completion: LLMCompletion
+    ) -> AssistantResponse:
+        """The model's text with its citations checked against the prompt's sources."""
+        warnings = list(context.warnings)
         cited, unknown = check_citations(completion.text, prompt.sources)
         if unknown:
             listed = ", ".join(f"[{number}]" for number in unknown)
             warnings.append(f"The answer cites {listed}, which match no retrieved source.")
         if completion.truncated:
             warnings.append("The answer reached the output limit (LLM_MAX_TOKENS) and may be cut.")
+        if completion.text.lstrip().startswith(INSUFFICIENT):
+            warnings.append(
+                "The retrieved code did not contain what this question needs: the answer may be "
+                "incomplete."
+            )
         logger.info(
             "Answer for project %s: %d sources, %d cited, model %s",
             context.project_id, len(prompt.sources), len(cited), completion.model,

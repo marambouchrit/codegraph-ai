@@ -21,3 +21,5 @@ sentence-transformers>=5.0,<7.0
 # APIs (Gemini, Groq, OpenRouter... free tiers) and for Anthropic (Claude).
 openai>=2.0,<3.0
 anthropic>=1.9,<2.0
+# Chat workflow (Phase 11): the steps of a question as a state graph (app/services/chat_workflow.py).
+langgraph>=1.2,<2.0

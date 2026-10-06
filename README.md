@@ -26,6 +26,7 @@ project — with answers grounded in the code and linked to source locations.
 | Code analysis  | Tree-sitter (official grammar packages)      |
 | Knowledge graph| Neo4j 5 (official Python driver)             |
 | Vector search  | Qdrant + local open-source embeddings (sentence-transformers) |
+| Chat workflow  | LangGraph (`StateGraph`): retrieval, prompt, LLM call and citation check as nodes |
 | LLM            | Provider-agnostic `LLMProvider`: Gemini (default, free tier), Groq, OpenRouter or any OpenAI-compatible API (`openai` SDK), Claude (`anthropic` SDK) |
 | Frontend       | React, TypeScript, Vite                      |
 
@@ -717,6 +718,16 @@ unavailable.
 Ask a question about an imported project over HTTP: the endpoint runs GraphRAG and the LLM
 assistant described above and returns the answer with its sources.
 
+The steps of a question are a LangGraph state graph (`app/services/chat_workflow.py`):
+
+```
+retrieve_context ─┬─ nothing retrieved ─▶ no_context ─▶ end      (no LLM call)
+                  └─▶ build_prompt ─▶ generate ─▶ verify_citations ─▶ end
+```
+
+Each node calls an existing service (GraphRAG, prompt builder, LLM provider, citation check)
+and adds its result to a shared state; the graph only decides the order and the branch.
+
 | Method | Endpoint | Body | Returns |
 | --- | --- | --- | --- |
 | `POST` | `/projects/{id}/chat` | `{"question": "..."}` (1–2000 characters, nothing else) | answer, numbered sources, status |
@@ -753,6 +764,10 @@ curl -X POST http://localhost:8000/projects/<project_id>/chat \
   knowledge graph connected it; `cited` whether the answer uses it.
 - `graph_status`: `complete`, or `partial` / `unavailable` when Neo4j failed (the answer then
   relies on semantic search only, with a warning).
+- `warnings`: shown in the chat. Among them: nothing was retrieved (no LLM call), the graph
+  failed, the answer cites a source that does not exist, or the model said the retrieved code
+  does not answer the question (its answer starts with "The available repository context is
+  insufficient").
 - Errors use the usual `{"detail": ...}` shape: 404 unknown project, 422 invalid body (empty
   or too long question, unknown field), 502 no usable LLM answer, 503 Qdrant, embedding model
   or LLM unavailable or misconfigured. Messages never contain keys or passwords.
@@ -819,7 +834,7 @@ Scripts: `npm run dev`, `npm run build`, `npm run lint`, `npm run typecheck`, `n
 
 | Suite | Command | Needs | Result (final run) |
 | --- | --- | --- | --- |
-| Backend, offline | `pytest` (from `backend/`) | nothing | 783 passed, 2 skipped |
+| Backend, offline | `pytest` (from `backend/`) | nothing | 791 passed, 2 skipped |
 | Backend, real stack | `pytest -m "network or neo4j or qdrant or embeddings or llm"` | internet, Neo4j, Qdrant, the embedding model, `LLM_API_KEY` | 17 passed |
 | Frontend | `npm test` (from `frontend/`) | nothing | 83 passed |
 | Frontend lint and build | `npm run lint`, `npm run build` | nothing | clean |
@@ -1006,7 +1021,8 @@ Imported code is treated as untrusted input:
 8. ✅ Vector RAG (chunking, embeddings, Qdrant)
 9. ✅ GraphRAG (hybrid retrieval + context fusion)
 10. ✅ LLM assistant (grounded, cited answers)
-11. ✅ Chat API (`POST /projects/{id}/analyze`, `POST /projects/{id}/chat`)
+11. ✅ Chat API (`POST /projects/{id}/analyze`, `POST /projects/{id}/chat`), its steps
+    orchestrated by a LangGraph state graph
 12. ✅ Frontend (import, analysis, chat with citations)
 13. ✅ Graph visualization (persisted analysis state, `GET /projects/{id}/graph`, Cytoscape.js)
 14. ✅ Advanced analysis (impact, dependencies, architecture summary) and incremental

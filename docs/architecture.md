@@ -24,7 +24,7 @@ Source code → chunking → embeddings → Qdrant vector index
 ```
 Question → query analysis
   → vector retrieval (Qdrant) + graph retrieval (Neo4j)
-  → context fusion → prompt builder → LLM
+  → context fusion → prompt builder → LLM        (steps orchestrated by LangGraph)
   → answer + sources (file paths, line ranges)
 ```
 
@@ -77,7 +77,8 @@ backend/app/
 │   ├── analysis_store.py    # analysis.json: the job, its progress, the last result
 │   ├── insights_service.py  # impact, dependencies, architecture: project check -> analyses
 │   ├── project_graph_service.py  # graph for display: project check -> bounded retrieval
-│   └── chat_service.py      # chat: project check -> GraphRAG -> LLM answer
+│   ├── chat_service.py      # chat: project check -> runs the chat workflow
+│   └── chat_workflow.py     # chat steps as a LangGraph state graph: retrieve -> prompt -> LLM -> citations
 ├── analysis/                # Phase 14: pure logic, no database or HTTP
 │   ├── changes.py           # SHA-256 of files, added/modified/unchanged/deleted
 │   ├── index.py             # analysis_index.json: per-file results and fingerprints
@@ -1098,10 +1099,37 @@ HTTP POST /projects/{id}/chat {"question": "..."}
   → routes/chat.py        body validated by ChatRequest; calls the service; ChatResponse out
   → ChatService.ask()     1. project exists (ProjectService)        → 404 first
                           2. LLM service built (factory)            → 503 before any retrieval
-                          3. GraphRAGService.build_context()        → one retrieval (Phase 9)
-                          4. LLMGenerationService.generate(context) → answer (Phase 10)
+                          3. the chat workflow (LangGraph), below
   → ChatResponse          answer, sources, cited, graph_status, warnings, model
 ```
+
+### The chat workflow (LangGraph)
+
+`services/chat_workflow.py` builds the steps of one question as a LangGraph `StateGraph`. The
+nodes share a `ChatState` (`project_id`, `question`, then `context`, `prompt`, `completion`,
+`response`); each node does one step through an existing service and returns the keys it adds.
+
+```
+START → retrieve_context      GraphRAGService.build_context(): Qdrant hits expanded in Neo4j
+          │ conditional edge: context.vector_results empty?
+          ├─ yes → no_context        LLMGenerationService.nothing_retrieved(): no LLM call → END
+          └─ no  → build_prompt      PromptBuilder.build(): context → prompt, numbered sources
+                   → generate        LLMProvider.generate(): prompt → text
+                   → verify_citations LLMGenerationService.respond(): [n] checked → END
+```
+
+- **Only orchestration:** no Cypher, Qdrant call, prompt text or provider SDK in the workflow.
+  `LLMGenerationService.generate()` runs the same steps in one call and gives the same answer
+  (tested), for code that does not need the graph.
+- **No cycle and no tools:** each step runs at most once per question; the model never calls a
+  function. One retrieval and at most one LLM call per question, as before.
+- **Errors propagate unchanged:** an `AppError` raised by a node (Qdrant down, LLM unavailable)
+  stops the run and reaches the global handler with its own status.
+- **Cost:** the graph compiles in about 2 ms; it is built with the `ChatService`, whose
+  services are still factories, so nothing is connected before the project is found.
+- **Why a graph:** each step is a function of the state, testable alone and visible in the
+  graph (`get_graph()`), and a new step or branch is an added node and edge rather than a
+  rewrite of `ask()`.
 
 ### Request and response
 
@@ -1160,6 +1188,9 @@ malformed JSON, retrieval and LLM errors with their status, LLM misconfiguration
 retrieval, a 500 that leaks no secret or path, no secret in any response, the other endpoints,
 the OpenAPI documentation, CORS for the Vite dev server, and that the route and service import
 no database client, retrieval package, prompt builder or LLM SDK.
+`tests/test_chat_workflow.py` checks the graph itself: its nodes and edges, the order of the
+steps, the branch that skips the LLM when nothing was retrieved, the same answer as
+`LLMGenerationService.generate()`, and errors propagated unchanged.
 `tests/test_chat_integration.py` (`-m "neo4j and qdrant and embeddings and llm"`) imports a
 ZIP, builds its graph and vector index on the real servers, and asks over HTTP.
 

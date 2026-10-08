@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { ChatResponse } from '../../types/api'
+import { alert, badge, messageAuthor } from '../../ui'
 import SourceList from '../SourceCitation/SourceList'
 import MarkdownAnswer from './MarkdownAnswer'
 
@@ -19,17 +20,19 @@ const GRAPH_NOTICE: Record<ChatResponse['graph_status'], string | null> = {
 export default function ChatMessage({ message }: { message: Message }) {
   if (message.role === 'user') {
     return (
-      <div className="message user">
-        <div className="message-author">You</div>
-        <div className="message-bubble">{message.text}</div>
+      <div className="grid min-w-0 justify-items-end gap-1.5">
+        <div className={messageAuthor}>You</div>
+        <div className="max-w-[min(100%,680px)] rounded-xl rounded-br-sm bg-accent px-3.5 py-2.5 wrap-anywhere whitespace-pre-wrap text-on-accent">
+          {message.text}
+        </div>
       </div>
     )
   }
   if (message.role === 'error') {
     return (
-      <div className="message assistant">
-        <div className="message-author">CodeGraph AI</div>
-        <p className="alert error" role="alert">
+      <div className="grid min-w-0 gap-1.5">
+        <div className={messageAuthor}>CodeGraph AI</div>
+        <p className={alert.error} role="alert">
           {message.text}
         </p>
       </div>
@@ -54,17 +57,17 @@ function AssistantMessage({ id, response }: { id: number; response: ChatResponse
   }
 
   return (
-    <div className="message assistant">
-      <div className="message-author">
+    <div className="grid min-w-0 gap-1.5" data-testid="assistant-message">
+      <div className={messageAuthor}>
         CodeGraph AI
-        {response.model && <span className="badge">{response.model}</span>}
+        {response.model && <span className={badge.neutral}>{response.model}</span>}
       </div>
-      <div className="message-bubble">
+      <div className="min-w-0 rounded-xl rounded-tl-sm border border-line bg-surface-muted px-4 py-3.5">
         {(notice || response.warnings.length > 0) && (
-          <div className="alert warn" role="status">
+          <div className={`${alert.warn} mb-3`} role="status">
             {notice && <div>{notice}</div>}
             {response.warnings.length > 0 && (
-              <ul>
+              <ul className="list-disc pl-5">
                 {response.warnings.map((warning) => (
                   <li key={warning}>{warning}</li>
                 ))}

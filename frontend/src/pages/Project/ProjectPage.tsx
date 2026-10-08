@@ -9,8 +9,8 @@ import ProjectHeader from '../../components/ProjectHeader/ProjectHeader'
 import { useAnalysis } from '../../hooks/useAnalysis'
 import { ApiError, getProject } from '../../services/api'
 import type { Project } from '../../types/api'
+import { alert, card, page as pageLayout } from '../../ui'
 import { errorText } from '../../utils/format'
-import './ProjectPage.css'
 
 type PageState =
   | { state: 'loading' }
@@ -65,34 +65,34 @@ function ProjectWorkspace({ projectId }: { projectId: string }) {
   }, [projectId])
 
   return (
-    <main className="page project-page">
-      <Link to="/" className="back-link">
+    <main className={pageLayout}>
+      <Link to="/" className="justify-self-start text-sm text-muted no-underline hover:text-accent">
         ← All projects
       </Link>
 
       {page.state === 'loading' && <LoadingState label="Loading project…" />}
       {page.state === 'not-found' && (
-        <section className="card">
-          <h1>Project not found</h1>
-          <p className="muted">It may have been deleted, or the link is wrong.</p>
+        <section className={card}>
+          <h1 className="text-2xl font-bold">Project not found</h1>
+          <p className="text-muted">It may have been deleted, or the link is wrong.</p>
           <Link to="/">Back to projects</Link>
         </section>
       )}
       {page.state === 'error' && (
-        <p className="alert error" role="alert">
+        <p className={alert.error} role="alert">
           Could not load the project. {page.message}
         </p>
       )}
       {page.state === 'loaded' && (
         <>
           {justImported && notAnalyzed && (
-            <p className="alert ok" role="status">
+            <p className={alert.ok} role="status">
               Project imported. Next step: analyze it, then ask questions.
             </p>
           )}
           <ProjectHeader project={page.project} />
           <AnalysisPanel view={view} onAnalyze={analyze} />
-          <div className="tabs" role="tablist" aria-label="Project tools">
+          <div className="flex gap-1 border-b border-line" role="tablist" aria-label="Project tools">
             <TabButton id="chat" label="Chat" active={tab} onSelect={openTab} />
             <TabButton id="graph" label="Knowledge Graph" active={tab} onSelect={openTab} />
             <TabButton id="insights" label="Insights" active={tab} onSelect={openTab} />
@@ -123,7 +123,11 @@ function TabButton({ id, label, active, onSelect }: { id: Tab; label: string; ac
       id={`tab-${id}`}
       aria-controls={`panel-${id}`}
       aria-selected={active === id}
-      className={`tab${active === id ? ' active' : ''}`}
+      className={`-mb-px cursor-pointer rounded-t-lg border px-4 py-2.5 font-semibold focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent ${
+        active === id
+          ? 'border-line border-b-page bg-page text-accent'
+          : 'border-transparent text-muted hover:text-fg'
+      }`}
       onClick={() => onSelect(id)}
     >
       {label}

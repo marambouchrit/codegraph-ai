@@ -2,14 +2,17 @@ import { useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router'
 import { importFromGithub, uploadProjectZip } from '../../services/api'
 import type { Project } from '../../types/api'
+import { alert, button, card, cardSubtitle, cardTitle, fileInput, input, spinner } from '../../ui'
 import { errorText } from '../../utils/format'
-import './ProjectImport.css'
 
 type ImportState =
   | { state: 'idle' }
   | { state: 'loading' }
   | { state: 'error'; message: string }
   | { state: 'done'; project: Project }
+
+const fieldLabel = 'mb-1.5 block text-sm font-semibold'
+const row = 'flex gap-2 max-[520px]:flex-col'
 
 /** Import a project from GitHub or a ZIP file, then open it. */
 export default function ProjectImport() {
@@ -63,17 +66,19 @@ export default function ProjectImport() {
   }
 
   return (
-    <div className="import-grid">
-      <form className="card" onSubmit={onGithubSubmit} aria-labelledby="github-title" noValidate>
-        <h2 id="github-title">Import from GitHub</h2>
-        <p className="card-subtitle">A public repository, cloned without running any of its code.</p>
-        <label className="field-label" htmlFor="github-url">
+    <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,420px),1fr))] gap-4">
+      <form className={card} onSubmit={onGithubSubmit} aria-labelledby="github-title" noValidate>
+        <h2 id="github-title" className={cardTitle}>
+          Import from GitHub
+        </h2>
+        <p className={cardSubtitle}>A public repository, cloned without running any of its code.</p>
+        <label className={fieldLabel} htmlFor="github-url">
           GitHub repository URL
         </label>
-        <div className="import-row">
+        <div className={row}>
           <input
             id="github-url"
-            className="input"
+            className={`${input} min-w-0`}
             type="url"
             inputMode="url"
             placeholder="https://github.com/owner/repository"
@@ -81,31 +86,33 @@ export default function ProjectImport() {
             onChange={(event) => setUrl(event.target.value)}
             disabled={busy}
           />
-          <button className="button" type="submit" disabled={busy}>
-            {github.state === 'loading' && <span className="spinner" aria-hidden="true" />}
+          <button className={button} type="submit" disabled={busy}>
+            {github.state === 'loading' && <span className={spinner} aria-hidden="true" />}
             {github.state === 'loading' ? 'Importing…' : 'Import from GitHub'}
           </button>
         </div>
         <ImportFeedback status={github} loading="Cloning the repository…" />
       </form>
 
-      <form className="card" onSubmit={onZipSubmit} aria-labelledby="zip-title" noValidate>
-        <h2 id="zip-title">Upload a ZIP</h2>
-        <p className="card-subtitle">An archive of your source code. Unsafe entries are rejected.</p>
-        <label className="field-label" htmlFor="zip-file">
+      <form className={card} onSubmit={onZipSubmit} aria-labelledby="zip-title" noValidate>
+        <h2 id="zip-title" className={cardTitle}>
+          Upload a ZIP
+        </h2>
+        <p className={cardSubtitle}>An archive of your source code. Unsafe entries are rejected.</p>
+        <label className={fieldLabel} htmlFor="zip-file">
           ZIP archive
         </label>
-        <div className="import-row">
+        <div className={row}>
           <input
             id="zip-file"
-            className="input file-input"
+            className={`${fileInput} min-w-0`}
             type="file"
             accept=".zip,application/zip"
             onChange={(event) => setFile(event.target.files?.[0] ?? null)}
             disabled={busy}
           />
-          <button className="button" type="submit" disabled={busy}>
-            {zip.state === 'loading' && <span className="spinner" aria-hidden="true" />}
+          <button className={button} type="submit" disabled={busy}>
+            {zip.state === 'loading' && <span className={spinner} aria-hidden="true" />}
             {zip.state === 'loading' ? 'Uploading…' : 'Upload ZIP'}
           </button>
         </div>
@@ -118,21 +125,21 @@ export default function ProjectImport() {
 function ImportFeedback({ status, loading }: { status: ImportState; loading: string }) {
   if (status.state === 'loading') {
     return (
-      <p className="alert" role="status">
+      <p className={`${alert.neutral} mt-3`} role="status">
         {loading}
       </p>
     )
   }
   if (status.state === 'error') {
     return (
-      <p className="alert error" role="alert">
+      <p className={`${alert.error} mt-3`} role="alert">
         {status.message}
       </p>
     )
   }
   if (status.state === 'done') {
     return (
-      <p className="alert ok" role="status">
+      <p className={`${alert.ok} mt-3`} role="status">
         Imported {status.project.name}. Opening the project…
       </p>
     )

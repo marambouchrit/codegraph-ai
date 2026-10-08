@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Core } from 'cytoscape'
 import type { ProjectGraph } from '../../types/api'
+import { alert, buttonSmall } from '../../ui'
 import { graphStylesheet, toElements } from './graphStyle'
+
+const control = `${buttonSmall} min-w-10`
 
 interface Props {
   graph: ProjectGraph
@@ -112,22 +115,28 @@ export default function GraphCanvas({ graph, hiddenRelationships, selectedId, im
   }
 
   return (
-    <div className="graph-canvas-wrap">
-      <div ref={containerRef} className="graph-canvas" role="img" aria-label="Knowledge graph" />
-      {status === 'loading' && <p className="graph-canvas-status muted">Drawing the graph…</p>}
+    <div className="relative min-w-0 self-start">
+      {/* touch-none: pinch and drag go to the graph, not the page */}
+      <div
+        ref={containerRef}
+        className="h-[min(70vh,560px)] min-h-[340px] touch-none overflow-hidden rounded-[10px] border border-line bg-surface-muted"
+        role="img"
+        aria-label="Knowledge graph"
+      />
+      {status === 'loading' && <p className="absolute top-3 left-3 text-muted">Drawing the graph…</p>}
       {status === 'error' && (
-        <p className="graph-canvas-status alert error" role="alert">
+        <p className={`${alert.error} absolute top-3 left-3`} role="alert">
           The graph viewer could not be loaded. Reload the page to try again.
         </p>
       )}
-      <div className="graph-controls" aria-label="Graph controls">
-        <button type="button" className="button secondary" onClick={() => zoomBy(1.25)} aria-label="Zoom in">
+      <div className="absolute right-2.5 bottom-2.5 flex gap-1.5" aria-label="Graph controls">
+        <button type="button" className={control} onClick={() => zoomBy(1.25)} aria-label="Zoom in">
           +
         </button>
-        <button type="button" className="button secondary" onClick={() => zoomBy(0.8)} aria-label="Zoom out">
+        <button type="button" className={control} onClick={() => zoomBy(0.8)} aria-label="Zoom out">
           −
         </button>
-        <button type="button" className="button secondary" onClick={() => cyRef.current?.fit(undefined, 30)}>
+        <button type="button" className={control} onClick={() => cyRef.current?.fit(undefined, 30)}>
           Fit
         </button>
       </div>

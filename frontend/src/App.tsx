@@ -2,6 +2,7 @@ import { Link, Route, Routes } from 'react-router'
 import AppHeader from './components/AppHeader/AppHeader'
 import HomePage from './pages/Home/HomePage'
 import ProjectPage from './pages/Project/ProjectPage'
+import { page } from './ui'
 
 export default function App() {
   return (
@@ -13,8 +14,8 @@ export default function App() {
         <Route
           path="*"
           element={
-            <main className="page">
-              <h1>Page not found</h1>
+            <main className={page}>
+              <h1 className="text-2xl font-bold">Page not found</h1>
               <Link to="/">Back to projects</Link>
             </main>
           }

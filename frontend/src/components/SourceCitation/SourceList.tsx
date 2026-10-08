@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import type { ChatSource } from '../../types/api'
-import './SourceList.css'
+import { badge, sectionTitle } from '../../ui'
+
+const list = 'grid gap-1.5'
 
 interface Props {
   sources: ChatSource[]
@@ -27,11 +29,11 @@ export default function SourceList({ sources, activeId, idPrefix }: Props) {
     return null
   }
   return (
-    <div className="sources">
+    <div className="mt-4 border-t border-line pt-3">
       {cited.length > 0 && (
         <>
-          <h3 className="sources-title">Sources</h3>
-          <ol className="source-list">
+          <h3 className={`${sectionTitle} mb-2`}>Sources</h3>
+          <ol className={list}>
             {cited.map((source) => (
               <SourceCitation key={source.id} source={source} active={source.id === activeId} idPrefix={idPrefix} />
             ))}
@@ -39,11 +41,11 @@ export default function SourceList({ sources, activeId, idPrefix }: Props) {
         </>
       )}
       {other.length > 0 && (
-        <details className="other-sources" open={otherActive || cited.length === 0 || undefined}>
-          <summary>
+        <details className="mt-2" open={otherActive || cited.length === 0 || undefined}>
+          <summary className="mb-1.5 cursor-pointer text-sm text-muted">
             {cited.length > 0 ? 'Other context given to the model' : 'Context given to the model'} ({other.length})
           </summary>
-          <ol className="source-list">
+          <ol className={list}>
             {other.map((source) => (
               <SourceCitation key={source.id} source={source} active={source.id === activeId} idPrefix={idPrefix} />
             ))}
@@ -69,22 +71,34 @@ function SourceCitation({ source, active, idPrefix }: { source: ChatSource; acti
   }
 
   return (
-    <li id={`${idPrefix}-source-${source.id}`} className={`source${active ? ' active' : ''}`} tabIndex={-1}>
-      <span className="source-id">[{source.id}]</span>
-      <div className="source-body">
-        <div className="source-head">
-          <code className="source-entity">{source.entity}</code>
-          <span className="badge">{source.entity_type}</span>
-          <span className={`badge ${source.found_by === 'graph' ? 'accent' : ''}`}>{FOUND_BY[source.found_by]}</span>
+    <li
+      id={`${idPrefix}-source-${source.id}`}
+      data-testid="source"
+      className={`flex scroll-m-20 gap-2.5 rounded-lg border px-3 py-2.5 transition-colors ${
+        active ? 'border-accent bg-accent-soft' : 'border-line bg-surface'
+      }`}
+      tabIndex={-1}
+    >
+      <span className="shrink-0 font-mono font-bold text-accent">[{source.id}]</span>
+      <div className="grid min-w-0 gap-1">
+        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
+          <code className="font-semibold break-all">{source.entity}</code>
+          <span className={badge.neutral}>{source.entity_type}</span>
+          <span className={source.found_by === 'graph' ? badge.accent : badge.neutral}>{FOUND_BY[source.found_by]}</span>
         </div>
-        <div className="source-location">
-          <code>{source.file}</code>
-          <span className="muted">
+        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-sm">
+          <code className="break-all">{source.file}</code>
+          <span className="text-muted">
             {source.start_line === source.end_line
               ? `Line ${source.start_line}`
               : `Lines ${source.start_line}–${source.end_line}`}
           </span>
-          <button type="button" className="copy" onClick={copy} title="Copy file:lines">
+          <button
+            type="button"
+            className="cursor-pointer rounded-md border border-line px-2 py-px text-xs text-muted hover:text-fg"
+            onClick={copy}
+            title="Copy file:lines"
+          >
             {copied ? 'Copied' : 'Copy'}
           </button>
         </div>

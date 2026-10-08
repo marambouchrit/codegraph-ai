@@ -1,6 +1,7 @@
-/* Design tokens and shared building blocks (buttons, cards, inputs, badges, alerts).
-   Component-specific styles live next to each component. */
+@import 'tailwindcss';
 
+/* Colour tokens. Light by default; the dark values apply when the system asks for dark mode,
+   so the components need no `dark:` variants. */
 :root {
   --bg: #f6f7fb;
   --surface: #ffffff;
@@ -21,14 +22,6 @@
   --code-bg: #0f172a;
   --code-text: #e2e8f0;
   --shadow: 0 1px 2px rgb(15 23 42 / 6%), 0 4px 16px rgb(15 23 42 / 4%);
-  --radius: 12px;
-  --mono: ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, monospace;
-
-  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  line-height: 1.55;
-  color: var(--text);
-  background: var(--bg);
-  -webkit-font-smoothing: antialiased;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -54,221 +47,96 @@
   }
 }
 
-* {
-  box-sizing: border-box;
+/* The tokens as Tailwind utilities: bg-surface, text-muted, border-line, bg-accent... */
+@theme inline {
+  --color-page: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-fg: var(--text);
+  --color-muted: var(--text-muted);
+  --color-line: var(--border);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-on-accent: var(--on-accent);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-bg);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-bg);
+  --color-danger: var(--error);
+  --color-danger-soft: var(--error-bg);
+  --color-code: var(--code-bg);
+  --color-code-fg: var(--code-text);
+  --shadow-card: var(--shadow);
+  --font-mono: ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, monospace;
 }
 
-body {
-  margin: 0;
-  min-height: 100vh;
-  background: var(--bg);
-}
+@layer base {
+  body {
+    @apply min-h-screen bg-page leading-[1.55] text-fg antialiased;
+  }
 
-h1,
-h2,
-h3 {
-  line-height: 1.25;
-}
+  a {
+    @apply text-accent underline;
+  }
 
-code {
-  font-family: var(--mono);
-  font-size: 0.9em;
-}
-
-a {
-  color: var(--accent);
-}
-
-/* ----- Layout ----- */
-
-.page {
-  max-width: 1100px;
-  margin: 0 auto;
-  padding: 32px 16px 64px;
-}
-
-.card {
-  padding: 24px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-  box-shadow: var(--shadow);
-}
-
-.card h2 {
-  margin: 0 0 4px;
-  font-size: 1.1rem;
-}
-
-.card-subtitle {
-  margin: 0 0 16px;
-  color: var(--text-muted);
-  font-size: 0.92rem;
-}
-
-.muted {
-  color: var(--text-muted);
-}
-
-/* ----- Forms ----- */
-
-.input {
-  width: 100%;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface);
-  color: var(--text);
-  font: inherit;
-}
-
-.input:focus-visible,
-.button:focus-visible,
-textarea:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-
-.button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 10px 16px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: var(--accent);
-  color: var(--on-accent);
-  font: inherit;
-  font-weight: 600;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.button:hover:not(:disabled) {
-  background: var(--accent-hover);
-}
-
-.button:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
-.button.secondary {
-  border-color: var(--border);
-  background: var(--surface);
-  color: var(--text);
-}
-
-.button.secondary:hover:not(:disabled) {
-  background: var(--surface-muted);
-}
-
-/* ----- Badges and alerts ----- */
-
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 10px;
-  border-radius: 999px;
-  background: var(--surface-muted);
-  color: var(--text-muted);
-  font-size: 0.8rem;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.badge.ok {
-  background: var(--ok-bg);
-  color: var(--ok);
-}
-
-.badge.warn {
-  background: var(--warn-bg);
-  color: var(--warn);
-}
-
-.badge.error {
-  background: var(--error-bg);
-  color: var(--error);
-}
-
-.badge.accent {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-
-.alert {
-  margin: 12px 0 0;
-  padding: 10px 14px;
-  border-radius: 8px;
-  font-size: 0.92rem;
-}
-
-.alert.error {
-  background: var(--error-bg);
-  color: var(--error);
-}
-
-.alert.warn {
-  background: var(--warn-bg);
-  color: var(--warn);
-}
-
-.alert.ok {
-  background: var(--ok-bg);
-  color: var(--ok);
-}
-
-.alert ul {
-  margin: 4px 0 0;
-  padding-left: 20px;
-}
-
-/* ----- Empty states ----- */
-
-.empty {
-  padding: 24px;
-  border: 1px dashed var(--border);
-  border-radius: 10px;
-  text-align: center;
-}
-
-.empty p {
-  margin: 0;
-}
-
-/* ----- Spinner ----- */
-
-.spinner {
-  display: inline-block;
-  width: 16px;
-  height: 16px;
-  border: 2px solid currentcolor;
-  border-right-color: transparent;
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-  flex-shrink: 0;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
+  code {
+    @apply font-mono text-[0.9em];
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .spinner {
-    animation-duration: 2.4s;
+/* The LLM's Markdown answer is HTML generated at run time, so it cannot carry utility
+   classes: it is styled from its container. */
+@layer components {
+  .markdown {
+    @apply wrap-anywhere;
   }
-}
 
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
+  .markdown > :first-child {
+    @apply mt-0;
+  }
+
+  .markdown > :last-child {
+    @apply mb-0;
+  }
+
+  .markdown :is(h1, h2, h3, h4) {
+    @apply mt-4 mb-1.5 text-base font-semibold;
+  }
+
+  .markdown :is(p, ul, ol) {
+    @apply my-2.5;
+  }
+
+  .markdown ul {
+    @apply list-disc pl-6;
+  }
+
+  .markdown ol {
+    @apply list-decimal pl-6;
+  }
+
+  .markdown li + li {
+    @apply mt-1;
+  }
+
+  .markdown :not(pre) > code {
+    @apply rounded bg-accent-soft px-1.5 py-px;
+  }
+
+  .markdown pre {
+    @apply my-3 overflow-x-auto rounded-lg bg-code px-3.5 py-3 text-sm leading-normal text-code-fg;
+  }
+
+  .markdown table {
+    @apply block max-w-full border-collapse overflow-x-auto;
+  }
+
+  .markdown :is(th, td) {
+    @apply border border-line px-2.5 py-1.5 text-left;
+  }
+
+  .markdown blockquote {
+    @apply my-2.5 border-l-[3px] border-line pl-3 text-muted;
+  }
 }

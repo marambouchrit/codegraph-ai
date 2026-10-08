@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { getHealth } from '../../services/api'
-import './AppHeader.css'
+import { badge } from '../../ui'
 
 type Backend = 'checking' | 'online' | 'offline'
 
@@ -16,19 +16,19 @@ export default function AppHeader() {
   }, [])
 
   return (
-    <header className="app-header">
-      <div className="app-header-inner">
-        <Link to="/" className="brand">
-          <span className="brand-mark" aria-hidden="true">
+    <header className="border-b border-line bg-surface">
+      <div className="mx-auto flex max-w-[1100px] items-center justify-between gap-3 px-4 py-3">
+        <Link to="/" className="flex items-center gap-2 text-lg font-bold text-fg no-underline">
+          <span className="text-accent" aria-hidden="true">
             ◆
           </span>
           CodeGraph AI
         </Link>
         <span
-          className={`badge ${backend === 'online' ? 'ok' : backend === 'offline' ? 'error' : ''}`}
+          className={backend === 'online' ? badge.ok : backend === 'offline' ? badge.error : badge.neutral}
           title="Backend API status"
         >
-          <span className="dot" aria-hidden="true" />
+          <span className="size-2 rounded-full bg-current" aria-hidden="true" />
           {backend === 'checking' && 'Checking backend…'}
           {backend === 'online' && 'Backend online'}
           {backend === 'offline' && 'Backend unreachable'}

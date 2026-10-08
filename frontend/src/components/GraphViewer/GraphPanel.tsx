@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { getGraph, getImpact } from '../../services/api'
 import { DEFAULT_GRAPH_NODES, DEFAULT_IMPACT_DEPTH, MAX_GRAPH_NODES, type ProjectGraph } from '../../types/api'
+import { alert, buttonSecondary, card, cardSubtitle, cardTitle, empty, input, inputSmall, typeDot } from '../../ui'
 import { errorText, formatNumber } from '../../utils/format'
 import LoadingState from '../LoadingState/LoadingState'
 import GraphCanvas from './GraphCanvas'
 import { entityColor, ENTITY_STYLES, IMPACT_COLOR, relationshipColor } from './graphStyle'
 import ImpactPanel, { type ImpactState } from './ImpactPanel'
 import NodeDetails from './NodeDetails'
-import './GraphViewer.css'
+
+const legendItem = 'inline-flex items-center gap-1.5'
 
 interface Props {
   projectId: string
@@ -22,18 +24,20 @@ export default function GraphPanel({ projectId, analyzed, analyzedAt }: Props) {
   const [limit, setLimit] = useState(DEFAULT_GRAPH_NODES)
 
   return (
-    <section className="card" aria-labelledby="graph-title">
-      <div className="graph-head">
-        <div>
-          <h2 id="graph-title">Knowledge Graph</h2>
-          <p className="card-subtitle">
+    <section className={card} aria-labelledby="graph-title">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex-[1_1_320px]">
+          <h2 id="graph-title" className={cardTitle}>
+            Knowledge Graph
+          </h2>
+          <p className={cardSubtitle}>
             The real Neo4j graph of this project: files, classes, functions and methods, and how
             they contain, call, import and depend on each other.
           </p>
         </div>
-        <label className="graph-limit">
+        <label className="flex items-center gap-2 text-sm font-semibold text-muted">
           Nodes
-          <select className="input" value={limit} onChange={(event) => setLimit(Number(event.target.value))}>
+          <select className={inputSmall} value={limit} onChange={(event) => setLimit(Number(event.target.value))}>
             {LIMITS.map((value) => (
               <option key={value} value={value}>
                 up to {value}
@@ -73,23 +77,23 @@ function GraphView({ projectId, limit, analyzed }: { projectId: string; limit: n
   if (view.state === 'loading') return <LoadingState label="Loading the knowledge graph…" />
   if (view.state === 'error') {
     return (
-      <p className="alert error" role="alert">
+      <p className={alert.error} role="alert">
         The knowledge graph could not be loaded. {view.message}
       </p>
     )
   }
   if (view.graph.nodes.length === 0) {
     return (
-      <div className="empty">
+      <div className={empty}>
         {analyzed ? (
           <>
             <p>The knowledge graph is empty.</p>
-            <p className="muted">No entities were found in this project's supported source files.</p>
+            <p className="text-muted">No entities were found in this project's supported source files.</p>
           </>
         ) : (
           <>
             <p>No knowledge graph yet.</p>
-            <p className="muted">Analyze the project to build its knowledge graph.</p>
+            <p className="text-muted">Analyze the project to build its knowledge graph.</p>
           </>
         )}
       </div>
@@ -100,7 +104,7 @@ function GraphView({ projectId, limit, analyzed }: { projectId: string; limit: n
       {!analyzed && (
         // Neo4j has a graph, but no analysis completed: e.g. an analysis stopped after the
         // graph step, during embedding. Show the real graph, and say why chat is not ready.
-        <p className="alert warn" role="status">
+        <p className={`${alert.warn} mb-3`} role="status">
           This graph comes from an analysis that did not complete (it may have been stopped
           during embedding), so the project is not ready for chat. Run Analyze to finish it.
         </p>
@@ -168,20 +172,20 @@ function GraphExplorer({ projectId, graph }: { projectId: string; graph: Project
 
   return (
     <>
-      <p className={graph.truncated ? 'alert warn' : 'muted graph-summary'} role="status">
+      <p className={graph.truncated ? `${alert.warn} mb-3` : 'mb-3 text-sm text-muted'} role="status">
         {graph.truncated
           ? `Partial graph: showing ${formatNumber(graph.nodes.length)} of ${formatNumber(graph.total_nodes)} nodes and ${formatNumber(graph.edges.length)} of ${formatNumber(graph.total_edges)} relationships. Files, classes and interfaces come first; raise the node limit to see more.`
           : `Complete graph: ${formatNumber(graph.nodes.length)} nodes, ${formatNumber(graph.edges.length)} relationships.`}
       </p>
 
-      <div className="graph-toolbar">
-        <form className="graph-search" onSubmit={onSearch} role="search">
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2.5">
+        <form className="flex max-w-[460px] flex-[1_1_260px] gap-2" onSubmit={onSearch} role="search">
           <label htmlFor="graph-search" className="sr-only">
             Find a node
           </label>
           <input
             id="graph-search"
-            className="input"
+            className={`${input} min-w-0`}
             placeholder="Find a node, e.g. AuthService.login"
             value={search}
             onChange={(event) => {
@@ -189,42 +193,42 @@ function GraphExplorer({ projectId, graph }: { projectId: string; graph: Project
               setSearchError(null)
             }}
           />
-          <button type="submit" className="button secondary">
+          <button type="submit" className={buttonSecondary}>
             Find
           </button>
         </form>
         {impacted && (
-          <span className="legend-item impact-legend">
-            <span className="type-dot" style={{ borderColor: IMPACT_COLOR }} aria-hidden="true" />
+          <span className={`${legendItem} text-sm`}>
+            <span className={`${typeDot} border-[3px]`} style={{ borderColor: IMPACT_COLOR }} aria-hidden="true" />
             Affected · {impacted.size}
           </span>
         )}
-        <div className="legend" aria-label="Entity types">
+        <div className="flex flex-wrap gap-x-3.5 gap-y-1.5 text-sm" aria-label="Entity types">
           {Object.entries(entityCounts).map(([type, n]) => (
-            <span key={type} className="legend-item">
-              <span className="type-dot" style={{ background: entityColor(type) }} aria-hidden="true" />
+            <span key={type} className={legendItem}>
+              <span className={typeDot} style={{ background: entityColor(type) }} aria-hidden="true" />
               {ENTITY_STYLES[type]?.label ?? type} · {n}
             </span>
           ))}
         </div>
       </div>
       {searchError && (
-        <p className="alert error" role="alert">
+        <p className={`${alert.error} mt-3`} role="alert">
           {searchError}
         </p>
       )}
-      <fieldset className="relationship-filter">
-        <legend>Relationships</legend>
+      <fieldset className="my-3 flex flex-wrap gap-x-4 gap-y-1.5 rounded-lg border border-line px-3 py-2 text-sm">
+        <legend className="px-1 text-xs font-semibold text-muted">Relationships</legend>
         {Object.entries(relationshipCounts).map(([type, n]) => (
-          <label key={type} className="filter-item">
+          <label key={type} className={legendItem}>
             <input type="checkbox" checked={!hidden.has(type)} onChange={() => toggle(type)} />
-            <span className="rel-line" style={{ background: relationshipColor(type) }} aria-hidden="true" />
+            <span className="inline-block h-[3px] w-4 rounded-sm" style={{ background: relationshipColor(type) }} aria-hidden="true" />
             {type} · {n}
           </label>
         ))}
       </fieldset>
 
-      <div className={`graph-layout${selectedId ? ' with-details' : ''}`}>
+      <div className={`grid gap-3${selectedId ? ' min-[860px]:grid-cols-[minmax(0,1fr)_300px]' : ''}`}>
         <GraphCanvas
           graph={graph}
           hiddenRelationships={hidden}
@@ -247,7 +251,7 @@ function GraphExplorer({ projectId, graph }: { projectId: string; graph: Project
             />
           </NodeDetails>
         ) : (
-          <p className="muted graph-hint">
+          <p className="text-sm text-muted">
             Click a node to see its details. Drag to pan, scroll or pinch to zoom.
           </p>
         )}

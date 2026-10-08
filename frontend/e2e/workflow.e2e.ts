@@ -30,18 +30,18 @@ test('import, analyze, chat, graph, impact and insights', async ({ page, request
 
   // 3-4. Analyze, and wait for the background job to finish.
   await page.getByRole('button', { name: 'Analyze Project' }).click()
-  const badge = page.locator('.analysis-head .badge').first()
+  const badge = page.getByTestId('analysis-status')
   await expect(badge).toHaveText(/^(Ready|Failed)$/, { timeout: 10 * 60_000 })
   await expect(badge).toHaveText('Ready')
 
   // 5-7. Ask a question: an answer with at least one source and one citation.
   await page.getByLabel('Your question').fill('How is authentication implemented?')
   await page.getByRole('button', { name: 'Send' }).click()
-  const answer = page.locator('.message.assistant .markdown').first()
+  const answer = page.getByTestId('assistant-message')
   await expect(answer).toBeVisible({ timeout: 180_000 })
-  await expect(answer).not.toBeEmpty()
-  expect(await page.locator('.message.assistant .source').count()).toBeGreaterThan(0)
-  expect(await page.locator('.message.assistant button.cite').count()).toBeGreaterThan(0)
+  await expect(answer.locator('.markdown')).not.toBeEmpty()
+  expect(await answer.getByTestId('source').count()).toBeGreaterThan(0)
+  expect(await answer.getByRole('button', { name: /^Show source/ }).count()).toBeGreaterThan(0)
 
   // 8-9. Knowledge graph: drawn, then a node selected.
   await page.getByRole('tab', { name: 'Knowledge Graph' }).click()
@@ -53,18 +53,18 @@ test('import, analyze, chat, graph, impact and insights', async ({ page, request
 
   // 10. Impact analysis: `AuthService.login` calls `verify_password`.
   await page.getByRole('button', { name: 'Impact analysis' }).click()
-  await expect(page.locator('.impact-summary')).toBeVisible({ timeout: 60_000 })
-  await expect(page.locator('.impact-level').first()).toContainText('login')
+  await expect(page.getByTestId('impact-summary')).toBeVisible({ timeout: 60_000 })
+  await expect(page.getByTestId('impact-level').first()).toContainText('login')
 
   // 11-12. Dependency analysis.
   await page.getByRole('tab', { name: 'Insights' }).click()
-  await expect(page.locator('.insight-summary')).toContainText('file-to-file dependencies', {
+  await expect(page.getByTestId('dependency-summary')).toContainText('file-to-file dependencies', {
     timeout: 60_000,
   })
 
   // 13-14. Architecture summary: facts from the graph, then the LLM's summary of them.
   await page.getByRole('button', { name: 'Generate architecture summary' }).click()
   await expect(page.getByText('Facts from the graph')).toBeVisible({ timeout: 180_000 })
-  expect(await page.locator('.facts li').count()).toBeGreaterThan(0)
-  await expect(page.locator('.architecture-summary .markdown')).not.toBeEmpty()
+  expect(await page.getByTestId('fact').count()).toBeGreaterThan(0)
+  await expect(page.getByTestId('architecture-summary').locator('.markdown')).not.toBeEmpty()
 })

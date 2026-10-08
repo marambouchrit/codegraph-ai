@@ -31,7 +31,7 @@ export default function MarkdownAnswer({ markdown, sourceIds, onCite, citeLabel 
               return (
                 <button
                   type="button"
-                  className="cite"
+                  className="mx-px inline-flex min-w-[1.5em] cursor-pointer items-center justify-center rounded-md border border-transparent bg-accent-soft px-1.5 align-[0.1em] text-[0.78em] leading-normal font-bold text-accent hover:border-accent focus-visible:border-accent"
                   onClick={() => onCite(id)}
                   aria-label={`Show ${citeLabel} ${id}`}
                 >

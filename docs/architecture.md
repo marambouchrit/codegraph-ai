@@ -469,14 +469,6 @@ types, which Cypher cannot parametrize, come only from the `schema.py` whitelist
 (`node_label()` and `relationship_type()` reject anything else). Credentials come from the
 environment and the password is a `SecretStr`. Docker Compose binds Neo4j to `127.0.0.1`.
 
-### Testing
-
-`pytest` needs no Neo4j: `tests/graph_fakes.py` replaces the **driver** with an in-memory store
-that executes the repository's few queries, so the real client, repository (batches,
-parameters, MERGE keys, project filters) and builder run unchanged. The optional
-`pytest -m neo4j` tests run builds against a real server (random project IDs, cleaned up
-afterwards) and check idempotency, isolation and a `(:Function)-[:CALLS]->()` traversal.
-
 Not in Phase 6, on purpose: graph API endpoints and deleting the graph when a project is deleted
 through the API (that would make project deletion depend on Neo4j being up; it will be wired
 together with the graph endpoints).
@@ -577,16 +569,6 @@ The Phase 6 rules apply: values are parameters (`$project_id`, `$entity_id`, `$t
 (sorted, so a set of types always gives the same query), directions from the `Direction` enum and
 depths from `traversal_depth()`. There is no "run this Cypher" method; retrieval queries are
 read-only and run in read transactions.
-
-### Testing
-
-`tests/test_graph_retrieval.py` writes a small Java project (`tests/retrieval_helpers.py`) into
-two projects with the real `GraphBuilder`, on the fake driver, and checks every operation,
-ordering, ambiguity, depth and limits, isolation, not-found cases, invalid arguments, malicious
-values and error translation, plus one project analyzed from real Python sources by Phases 3-5.
-`tests/graph_fakes.py` answers the retrieval queries in memory, and only accepts a query that is
-exactly the text the repository's builder produces. `pytest -m neo4j` asks every question of
-`retrieval_helpers.QUESTIONS` to a real Neo4j and to the fake, and requires identical answers.
 
 Not in Phase 7, on purpose: HTTP endpoints for retrieval (they will come with the phase that
 uses them), vector search, and anything LLM-related.
@@ -765,21 +747,6 @@ exception types. Filters are built with qdrant-client objects (`FieldCondition`,
 `MatchValue`...), never from text; collection names come from settings and must match
 `[A-Za-z0-9_-]{1,64}`. Repository code is only read as text: never imported or executed.
 
-### Testing
-
-Unit tests need no server and no model: the real `QdrantVectorStore` runs on qdrant-client's
-local in-memory mode (`QdrantClient(":memory:")`), and `HashingEmbeddings` (tests only) hashes
-words into a normalized vector so texts sharing words are close. Chunker tests use real Phase 3-4
-output in the four languages. Optional tests: `pytest -m qdrant` indexes and searches on a real
-server (temporary collection) and checks it answers exactly like the in-memory mode;
-`pytest -m embeddings` runs the real model (1024 dimensions for BGE-M3, finite normalized
-vectors, batches equal to single embeddings), including the end-to-end check that "How does the
-application authenticate users?" finds the login code; with Neo4j and Qdrant started,
-`pytest -m "neo4j and qdrant and embeddings"` also runs GraphRAG with the real model. Unit tests
-cover the model change itself: another model's vectors are never searched, a re-indexing with a
-new model replaces the old points only once it succeeds, a failed one keeps the old index
-searchable, and a query vector of the wrong dimension gets a clear error.
-
 Not in Phase 8, on purpose: API endpoints, hybrid retrieval with the graph, reranking, LLM.
 
 ## GraphRAG retrieval (Phase 9)
@@ -917,19 +884,6 @@ instead of silent. Errors are `AppError`s; the service knows nothing about HTTP.
 Nothing new is exposed: no Cypher or Qdrant filter is built here (only the typed operations of
 Phases 7 and 8, with their whitelists and parameters), no traversal beyond one hop and bounded
 paths, no code executed or sent anywhere, logs hold counts and error types only.
-
-### Testing
-
-`tests/test_graphrag.py` builds a small project (AuthService, UserRepository, Database, a
-subclass, an unrelated file) twice, in the fake Neo4j (real Phase 3-6 pipeline) and in the
-in-memory Qdrant (real chunker), for projects A and B. It checks seeds and deduplication, method,
-class and file expansions, paths, missing seeds, isolation, Neo4j down or failing midway, Qdrant
-down, every limit, determinism, source and relationship metadata, and that nothing but the two
-retrieval services is used. An end-to-end test imports the project as a ZIP, builds the graph
-and the vector index with the real services, and checks that "How is authentication
-implemented?" gives `AuthService.login` with its lines, `CALLS UserRepository.find_user` and
-`CALLS AuthService.create_token`. `pytest -m "neo4j and qdrant"` builds the same context on the
-real servers and requires it to equal the fakes'.
 
 Not in Phase 9, on purpose: API endpoints, LLM calls, prompts, reranking, query rewriting.
 
@@ -1071,20 +1025,6 @@ so the model cannot run code, query a database or change what is retrieved; cita
 against real sources. Privacy: with an API provider, the **retrieved context** (the selected
 chunks and their metadata, never the whole repository) is sent to that provider.
 
-### Testing
-
-`tests/test_llm.py` needs no network and no key: the GraphRAG context comes from the Phase 9
-test world (real analysis, fake Neo4j, in-memory Qdrant), the LLM is a fake provider, and the
-two providers run against fake SDK clients. It checks the section order and content,
-source numbering, status and warnings, determinism, prompt injection (repository text cannot
-close a section; the test fails without escaping), the "How is authentication implemented?"
-flow end to end with citations, unknown citations, no LLM call when nothing was retrieved,
-errors propagated (never replaced), the settings and provider factory (missing key,
-unsupported provider, invalid values), the exact request sent to Claude, every SDK error
-translated without leaking the key, and that `app/llm/` imports no database client, embedding
-or retrieval module. `pytest -m llm` calls the real model (needs a key): a grounded, cited
-answer, and "insufficient" for an unrelated question.
-
 Not in Phase 10, on purpose: API endpoints (Phase 11), streaming, conversation history, memory,
 agents or tools, reranking.
 
@@ -1176,24 +1116,6 @@ The route is a plain `def` (retrieval and the LLM call block), run in FastAPI's 
 Nothing is re-scanned, re-parsed, re-embedded or rebuilt per question: one GraphRAG call, one
 LLM call.
 
-### Testing
-
-`tests/test_chat_api.py` (no server, no model, no key): a real project imported from a ZIP, the
-Phase 9 test world as retrieval (real analysis, fake Neo4j, in-memory Qdrant) or a stub, and the
-real `LLMGenerationService` over the Phase 10 fake provider. It checks the success path and the
-response schema, sources with files and lines, graph unavailable (200 with status and warning),
-an unindexed project (no LLM call), 404 for unknown and invalid IDs with nothing else run, 422
-for every invalid body (including `cypher`, `filter`, `system_prompt`, `top_k` fields) and
-malformed JSON, retrieval and LLM errors with their status, LLM misconfiguration failing before
-retrieval, a 500 that leaks no secret or path, no secret in any response, the other endpoints,
-the OpenAPI documentation, CORS for the Vite dev server, and that the route and service import
-no database client, retrieval package, prompt builder or LLM SDK.
-`tests/test_chat_workflow.py` checks the graph itself: its nodes and edges, the order of the
-steps, the branch that skips the LLM when nothing was retrieved, the same answer as
-`LLMGenerationService.generate()`, and errors propagated unchanged.
-`tests/test_chat_integration.py` (`-m "neo4j and qdrant and embeddings and llm"`) imports a
-ZIP, builds its graph and vector index on the real servers, and asks over HTTP.
-
 Not in Phase 11, on purpose: authentication, conversation history, streaming, rate limiting.
 Analysis was added right after, as Phase 11.5 (below).
 
@@ -1246,15 +1168,6 @@ shared with chat, and nothing is connected before the project is found.
 **Synchronous on purpose:** the route is a plain `def` in FastAPI's thread pool and returns when
 analysis is done. That takes seconds for a small project and minutes for a large one on a CPU.
 There are no background jobs, queues or progress polling yet.
-
-**Testing:** `tests/test_analysis_api.py` (offline) runs the real `GraphService` and
-`VectorIndexService` over the fake Neo4j, an in-memory Qdrant and hashing embeddings. It covers
-the response against what the databases hold, re-analysis without duplicates, 404s with nothing
-touched, Neo4j down (no indexing started), indexing failures (never `ready`, previous vectors
-kept), a generic 500, 409 for concurrent runs, OpenAPI, the import rules, and
-import -> analyze -> chat. `tests/test_analysis_integration.py`
-(`-m "neo4j and qdrant and embeddings and llm"`) does import -> analyze -> chat over HTTP on the
-real servers with Gemini.
 
 ## Analysis state and knowledge graph API (Phase 13)
 
@@ -1326,21 +1239,6 @@ routes/graph.py            limit validated by FastAPI (1..500) -> 422
   - Never: columns, the internal `build_id`, or anything from another project.
 - **Errors:** an unanalyzed project gives an empty graph. Neo4j down gives 503 through the
   existing client error translation. Unknown or invalid projects give 404 before any connection.
-
-### Testing
-
-- **`tests/test_graph_api.py`:** real projects built by `GraphService` into the fake Neo4j. It
-  covers the real nodes and edges, the display fields, determinism, isolation, truncation by
-  nodes and by edges, an exact limit, invalid limits (422, no query), ignored extra parameters,
-  an empty graph, 404s, Neo4j down (503), a generic 500, lazy connections, OpenAPI and an
-  import check.
-- **`tests/test_analysis_api.py`:**
-  - state before and after analysis, a reload with a new service, and no database query on read
-  - re-analysis after a code change, and failed first or re-analysis (never `ready`)
-  - project isolation, legacy, unreadable and foreign records, deletion, OpenAPI
-- **`tests/retrieval_helpers.py` (opt-in, real Neo4j):** the project graph, full and
-  truncated, is one of the questions asked to both real Neo4j and the fake; their answers are
-  identical.
 
 ## Incremental background analysis (Phase 14)
 
@@ -1491,31 +1389,6 @@ the work:
 Embedding first means the vectors of the changed chunks are held in memory until they are
 written: negligible for an incremental run, larger for the first analysis of a big project.
 
-### Testing
-
-- **`tests/test_incremental_analysis.py`:**
-  - *Changes:* an unchanged project (no parse, no embedding, no write); a modified file (only
-    it is parsed, one chunk embedded, the rest reused); moved code (new line numbers, no
-    embedding); added and deleted files.
-  - *Cross-file relationships:* a deleted file, a restored file, a renamed function, and a new
-    definition that resolves a call of an unchanged file.
-  - *Equivalence:* an incremental run and a full run leave identical databases.
-  - *Idempotency and isolation:* repeated runs change nothing; projects don't affect each
-    other.
-  - *Detection:* content-based change detection; a file that cannot be parsed is remembered,
-    not retried.
-  - *Fallbacks to a full run:* no index, an unreadable index, an emptied graph or vector
-    store, another model, or a forced full run.
-  - *Failures:* before writing (previous analysis kept) and while writing (repaired by the
-    next full run).
-- **`tests/test_analysis_api.py`:** 202 with a queued job, the worker, real counts read over
-  HTTP while embedding, phase order, 409, queued projects, a real thread, failures, an
-  interrupted job, and the persisted state including the Phase 13 format.
-- **`tests/test_analysis_index.py`:** SHA-256, change detection, fingerprints, graph diff, and
-  the index save and load.
-- **Real Neo4j (opt-in):** an incremental `apply()` on real Neo4j and on the fake give the same
-  graph.
-
 ## Advanced analysis (Phase 14)
 
 Three read-only endpoints built on graph retrieval (Phase 7). They are deterministic, except
@@ -1635,9 +1508,48 @@ src/
   - A new node limit or a new analysis remounts the view, which loads the graph again.
 - **Tabs:** Chat, Knowledge Graph and Insights stay mounted once opened, so switching keeps
   the chat history, the drawn graph and the insights.
-- **Tests:** Vitest, Testing Library and jsdom, with a fake backend that replaces `fetch`. In
-  jsdom (no canvas), `GraphCanvas` is replaced by a list of the nodes it receives, and the
-  conversion to Cytoscape elements is tested directly.
+- **Styles:** Tailwind CSS v4 (`@tailwindcss/vite`). Utility classes are written in the
+  components; `src/index.css` holds the colour tokens as CSS variables (light, and dark under
+  `prefers-color-scheme`) exposed to Tailwind with `@theme`, so no `dark:` variant is needed;
+  `src/ui.ts` holds the class lists of the shared building blocks (card, button, input, badge,
+  alert). The LLM's Markdown is generated HTML, so it is styled from its `.markdown` container.
+
+## Testing
+
+The test suite is small on purpose: each test shows one behavior that matters, on the same
+4-file sample project (`tests/helpers.py`: `AuthService`, `UserRepository`, `Database`, and an
+unrelated chart function).
+
+```
+backend/tests/
+├── helpers.py              the sample project, analyze(), a fake LLM, a fake retrieval
+├── test_extraction.py      source file -> classes, functions, methods (parents, lines, IDs)
+├── test_relationships.py   calls, imports, inheritance resolved across files; external
+│                           libraries reported as unresolved
+├── test_chunker.py         a method is one chunk, a class is a skeleton, long code is split;
+│                           a chunk carries its entity ID (the link between Qdrant and Neo4j)
+├── test_changes.py         SHA-256 change detection: added, modified, unchanged, deleted
+├── test_insights.py        file dependencies, hubs, circular dependencies (no recursion)
+├── test_chat_workflow.py   the LangGraph workflow: step order, no-context branch, citation
+│                           check, errors raised unchanged
+├── test_api.py             HTTP: ZIP import, chat answer with sources, 404, 422
+└── test_integration.py     the whole pipeline on the real services (opt-in)
+frontend/e2e/
+└── workflow.e2e.ts         the main workflow in a real browser (Playwright)
+backend/evaluation/         retrieval evaluation: GraphRAG against vector-only
+```
+
+Three levels:
+
+- **Unit tests** (`pytest`, 39 tests, under a minute): pure logic, with no server, no model
+  and no API key. The parsing, extraction, relationship and chunking code is real; only the
+  LLM and the retrieval are replaced by fakes, in the chat and API tests.
+- **Integration test** (`pytest -m integration`): import, full analysis, incremental
+  re-analysis after an edit and a deletion, impact, dependencies, architecture summary and
+  chat, over HTTP, on the real Neo4j, Qdrant, embedding model and LLM. It is the only test of
+  the Cypher queries and of the Qdrant calls, which is why it uses the real servers.
+- **Browser end-to-end test** (`npm run e2e`): the same workflow as a user does it, in a real
+  browser against the running application.
 
 ## Future packages
 

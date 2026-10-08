@@ -28,7 +28,7 @@ project — with answers grounded in the code and linked to source locations.
 | Vector search  | Qdrant + local open-source embeddings (sentence-transformers) |
 | Chat workflow  | LangGraph (`StateGraph`): retrieval, prompt, LLM call and citation check as nodes |
 | LLM            | Provider-agnostic `LLMProvider`: Gemini (default, free tier), Groq, OpenRouter or any OpenAI-compatible API (`openai` SDK), Claude (`anthropic` SDK) |
-| Frontend       | React, TypeScript, Vite                      |
+| Frontend       | React, TypeScript, Vite, Tailwind CSS        |
 
 See [docs/architecture.md](docs/architecture.md) for the full architecture.
 
@@ -79,12 +79,8 @@ Run the tests:
 
 ```bash
 cd backend
-pytest               # fast tests: no internet, no Neo4j needed
-pytest -m network    # clones a real repository from GitHub
-pytest -m neo4j      # needs a running Neo4j (see "Knowledge graph" below)
-pytest -m qdrant     # needs a running Qdrant (see "Semantic code search" below)
-pytest -m embeddings # runs the real embedding model (BGE-M3, ~2.3 GB downloaded on first use)
-pytest -m llm        # calls the real LLM (needs LLM_API_KEY; free with a free-tier key)
+pytest                 # fast tests: no server, no model, no API key
+pytest -m integration  # the whole pipeline on the real Neo4j, Qdrant, embedding model and LLM
 ```
 
 ### Importing a project (API)
@@ -193,7 +189,7 @@ NEO4J_DATABASE=neo4j
 ```
 
 **3. Check that it works:** open the Neo4j Browser at <http://localhost:7474> (user `neo4j`),
-or run `pytest -m neo4j` from `backend/`.
+or run `pytest -m integration` from `backend/` (it also needs Qdrant and `LLM_API_KEY`).
 
 **4. Build a project's graph** (no API endpoint yet; from `backend/`, with the virtual
 environment active):
@@ -273,11 +269,6 @@ Every operation is scoped to one project, results are limited (`limit`, default 
 and traversals are bounded (`max_depth`, at most 5). Names shared by several entities return all
 of them. An unknown entity ID raises `EntityNotFoundError`; a question with no answer returns an
 empty list. See [docs/architecture.md](docs/architecture.md#graph-retrieval-phase-7).
-
-**Tests:** `pytest` checks every retrieval operation against an in-memory fake (no server
-needed). `pytest -m neo4j` (Neo4j started, `NEO4J_PASSWORD` in `backend/.env` matching the
-Docker Compose password) also asks every retrieval question to the real server and to the fake,
-and requires identical answers.
 
 ### Semantic code search (Qdrant)
 
@@ -375,11 +366,7 @@ Searching a collection built with a model of another dimension fails with a clea
 and searches only compare vectors of the same model, so an interrupted re-indexing never breaks
 search with the previous model.
 
-**Tests:** `pytest` covers chunking, indexing and search with an in-memory Qdrant and a tiny test
-embedding (no server, no download). `pytest -m qdrant` (Qdrant started) runs them against the
-real server; `pytest -m embeddings` runs the real model (dimension, finite normalized vectors,
-batches, an end-to-end semantic search). `pytest -m "neo4j and qdrant and embeddings"` runs
-GraphRAG with the real model on both servers. On a CPU, BGE-M3 indexes about 3–4 s per chunk
+On a CPU, BGE-M3 indexes about 3–4 s per chunk
 (roughly an hour for a repository of 1,000 chunks); searching takes about 0.1 s.
 
 ### GraphRAG retrieval
@@ -443,9 +430,6 @@ top 3 seeds, at most 3 relationships long), deterministic, and scoped to one pro
 down, the context keeps the vector evidence with `graph_status="unavailable"` and a warning (or
 fails, with `GRAPHRAG_REQUIRE_GRAPH=true`). See
 [docs/architecture.md](docs/architecture.md#graphrag-retrieval-phase-9).
-
-**Tests:** `pytest` covers GraphRAG with the fake Neo4j and the in-memory Qdrant;
-`pytest -m "neo4j and qdrant"` (both started) checks the real servers give the same context.
 
 ### LLM assistant (grounded answers)
 
@@ -511,10 +495,6 @@ print(response.graph_status, response.warnings)
   service is one preset line in `create_llm_provider()`.
 
 See [docs/architecture.md](docs/architecture.md#llm-assistant-phase-10).
-
-**Tests:** `pytest` covers prompt building, citations, errors and the provider with fakes (no
-network, no key). `pytest -m llm` asks the real model two questions (needs a key; free with a
-free-tier key).
 
 ### Analyze, then chat (API)
 
@@ -775,10 +755,6 @@ curl -X POST http://localhost:8000/projects/<project_id>/chat \
 - The first question after starting the server also loads the embedding model (about 20–30 s
   on a CPU); the next ones reuse it.
 
-**Tests:** `pytest` covers both endpoints with fake databases, fake retrieval and a fake LLM
-(no server, no key). `pytest -m "neo4j and qdrant and embeddings and llm"` runs import ->
-analyze -> chat over HTTP with every real service.
-
 ### Frontend
 
 ```bash
@@ -825,20 +801,42 @@ Open <http://localhost:5173> (the backend must be running on port 8000).
 All HTTP calls are in `src/services/api.ts`, typed by `src/types/api.ts`, which mirrors the
 backend's Pydantic schemas.
 
-Scripts: `npm run dev`, `npm run build`, `npm run lint`, `npm run typecheck`, `npm test`
-(Vitest + Testing Library, with a fake backend: no server needed).
+Styling is Tailwind CSS v4: utility classes in the components, the colour tokens (light and
+dark) in `src/index.css`, and the shared building blocks (card, button, input, badge, alert)
+in `src/ui.ts`.
+
+Scripts: `npm run dev`, `npm run build`, `npm run lint`, `npm run typecheck`, `npm run e2e`
+(the browser test, see [Testing and evaluation](#testing-and-evaluation)).
 
 ## Testing and evaluation
 
 ### Tests
 
-| Suite | Command | Needs | Result (final run) |
+The test suite is small on purpose: one short file per part of the pipeline, one test of the
+whole pipeline on the real services, and one test in a real browser.
+
+| Suite | Command | Needs | Result |
 | --- | --- | --- | --- |
-| Backend, offline | `pytest` (from `backend/`) | nothing | 791 passed, 2 skipped |
-| Backend, real stack | `pytest -m "network or neo4j or qdrant or embeddings or llm"` | internet, Neo4j, Qdrant, the embedding model, `LLM_API_KEY` | 17 passed |
-| Frontend | `npm test` (from `frontend/`) | nothing | 83 passed |
-| Frontend lint and build | `npm run lint`, `npm run build` | nothing | clean |
-| Browser end-to-end | `npm run e2e` (from `frontend/`) | see below | 1 passed (14 steps) |
+| Backend unit tests | `pytest` (from `backend/`) | nothing | 39 passed |
+| Backend integration test | `pytest -m integration` | Neo4j, Qdrant, the embedding model, `LLM_API_KEY` | 1 passed |
+| Frontend lint and build | `npm run lint`, `npm run build` (from `frontend/`) | nothing | clean |
+| Browser end-to-end test | `npm run e2e` (from `frontend/`) | see below | 1 passed (14 steps) |
+
+The backend unit tests (`backend/tests/`), with no server, no model and no API key:
+
+| File | What it checks |
+| --- | --- |
+| `test_extraction.py` | a source file gives its classes, functions and methods, with parents and lines |
+| `test_relationships.py` | calls, imports and inheritance are resolved across files |
+| `test_chunker.py` | a method is one chunk, a class is a skeleton, a long function is split |
+| `test_changes.py` | incremental analysis: SHA-256 finds the added, modified and deleted files |
+| `test_insights.py` | file dependencies, the most used files, circular dependencies |
+| `test_chat_workflow.py` | the LangGraph workflow: order of the steps, no-context branch, citation check |
+| `test_api.py` | the HTTP API: import a ZIP, ask a question, 404 and 422 errors |
+
+The integration test (`test_integration.py`) runs import, analysis, incremental re-analysis,
+impact, dependencies, architecture summary and chat over HTTP, on the real Neo4j, Qdrant,
+embedding model and LLM.
 
 The browser test (`frontend/e2e/workflow.e2e.ts`, Playwright) drives the real application:
 import a 4-file ZIP, analyze it, ask a question (answer, sources and citations), open the

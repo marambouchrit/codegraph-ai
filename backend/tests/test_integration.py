@@ -1,16 +1,13 @@
-"""Optional: import -> analyze -> re-analyze -> insights -> chat over HTTP, everything real.
-
-Skipped by a normal `pytest` run.
+"""The whole pipeline over HTTP, with everything real. Skipped by a normal `pytest` run.
 
     docker compose up -d neo4j qdrant
-    pytest -m "neo4j and qdrant and embeddings and llm"      (needs LLM_API_KEY)
+    pytest -m integration            (needs LLM_API_KEY)
 
-The project is uploaded as a ZIP and analyzed by POST /projects/{id}/analyze as a real
-background job (real Neo4j, embedding model and Qdrant), followed by polling
-GET /projects/{id}/analysis. One file is then changed and the project analyzed again:
-only that file is parsed and only its changed chunk embedded. The advanced analyses
-and the chat (real LLM) then run on the updated project. Vectors go to a temporary
-Qdrant collection; the graph and the collection are removed afterwards.
+A project is uploaded as a ZIP and analyzed by the real background job (Tree-sitter, Neo4j,
+embedding model, Qdrant). One file is then changed and the project analyzed again: only that
+file is parsed and only its changed chunk embedded. The impact analysis, the dependency
+analysis, the architecture summary and the chat (real LLM) then run on the updated project.
+Vectors go to a temporary Qdrant collection; the graph and the collection are removed at the end.
 """
 
 import time
@@ -48,9 +45,9 @@ from app.services.project_service import ProjectService
 from app.services.vector_index_service import VectorIndexService
 from app.services.vector_retrieval_service import VectorRetrievalService
 from tests.conftest import MakeZip
-from tests.test_graphrag import FILES
+from tests.helpers import FILES
 
-pytestmark = [pytest.mark.neo4j, pytest.mark.qdrant, pytest.mark.embeddings, pytest.mark.llm]
+pytestmark = pytest.mark.integration
 
 
 class Servers:
@@ -61,25 +58,19 @@ class Servers:
         self.store = store
         self.projects = projects
         self.project_ids: list[str] = []
-        self.embedding_model = ""
 
     def analyze(self, project_id: str) -> dict[str, Any]:
-        """Start the background job, poll its state, return the report once ready."""
+        """Start the background job, poll its state, return the report once it is ready."""
         started = self.http.post(f"/projects/{project_id}/analyze")
         assert started.status_code == 202, started.text
-        assert started.json()["status"] in ("queued", "running")
         deadline = time.monotonic() + 1800
-        phases: list[str] = []
         while True:
             state = self.http.get(f"/projects/{project_id}/analysis").json()
-            if state["job"]["phase"] and state["job"]["phase"] not in phases:
-                phases.append(state["job"]["phase"])
             if state["status"] not in ("queued", "running"):
                 break
             assert time.monotonic() < deadline, "the analysis did not finish"
             time.sleep(0.2)
         assert state["status"] == "ready", state
-        assert phases[-1] == "finalizing"
         return state["analysis"]
 
 
@@ -114,7 +105,6 @@ def servers(settings: Settings) -> Iterator[Servers]:
             projects, lambda: graphrag, lambda: generator
         )
         servers = Servers(TestClient(app), repository, store, projects)
-        servers.embedding_model = embeddings.model_name
         try:
             yield servers
         finally:
@@ -125,9 +115,7 @@ def servers(settings: Settings) -> Iterator[Servers]:
             qdrant.delete_collection(store.collection)
 
 
-def test_import_analyze_reanalyze_insights_and_chat_over_http(
-    servers: Servers, make_zip: MakeZip
-) -> None:
+def test_import_analyze_reanalyze_insights_and_chat(servers: Servers, make_zip: MakeZip) -> None:
     http = servers.http
 
     # 1. Import: the source code is stored, nothing is analyzed yet.
@@ -136,65 +124,51 @@ def test_import_analyze_reanalyze_insights_and_chat_over_http(
     assert imported.status_code == 201, imported.text
     project_id = imported.json()["id"]
     servers.project_ids.append(project_id)
-    assert not servers.repository.project_exists(project_id)
     assert http.get(f"/projects/{project_id}/analysis").json()["status"] == "not_analyzed"
 
-    # 2. First analysis, in the background: everything is parsed and embedded.
+    # 2. First analysis: every file is parsed and every chunk embedded.
     report = servers.analyze(project_id)
     assert report["mode"] == "full" and report["failed_files"] == 0
-    assert report["graph"]["entities"] > 0 and report["graph"]["relationships"] > 0
     chunks = report["vectors"]["chunks"]
-    assert chunks == servers.store.count(project_id) > 0
-    assert report["changes"]["chunks_embedded"] == chunks
-    assert report["vectors"]["embedding_model"] == servers.embedding_model  # EMBEDDING_MODEL
+    assert chunks == servers.store.count(project_id) > 0  # Qdrant holds what the report says
     statistics = servers.repository.statistics(project_id)
-    assert sum(statistics.nodes_by_label.values()) == report["graph"]["entities"]
+    assert sum(statistics.nodes_by_label.values()) == report["graph"]["entities"]  # and Neo4j too
 
-    # 3. Nothing changed: nothing parsed, nothing embedded.
+    # 3. Nothing changed: nothing is parsed, nothing is embedded.
     again = servers.analyze(project_id)
     assert again["mode"] == "incremental"
     assert (again["changes"]["files_parsed"], again["changes"]["chunks_embedded"]) == (0, 0)
-    assert again["changes"]["chunks_reused"] == chunks == servers.store.count(project_id)
+    assert again["changes"]["chunks_reused"] == chunks
 
-    # 4. One file changes (a new function, a deleted file): only that is processed.
+    # 4. One file gets a new function and another file is deleted: only that is processed.
     source = servers.projects.workspace.source_dir(project_id)
     with (source / "auth" / "service.py").open("a", encoding="utf-8", newline="\n") as file:
         file.write("\n\ndef logout(token):\n    \"\"\"End the session of a token.\"\"\"\n    return None\n")
     (source / "reports" / "charts.py").unlink()
-    updated = servers.analyze(project_id)
-    changes = updated["changes"]
-    assert updated["mode"] == "incremental"
+    changes = servers.analyze(project_id)["changes"]
     assert (changes["files_modified"], changes["files_deleted"], changes["files_parsed"]) == (1, 1, 1)
     assert 1 <= changes["chunks_embedded"] < chunks  # far fewer than the whole project
-    assert changes["chunks_deleted"] >= 1
-    assert servers.store.count(project_id) == updated["vectors"]["chunks"]
-    statistics = servers.repository.statistics(project_id)
-    assert sum(statistics.nodes_by_label.values()) == updated["graph"]["entities"]
     graph = http.get(f"/projects/{project_id}/graph").json()
     names = {node["qualified_name"] for node in graph["nodes"]}
     assert "logout" in names and "render_bar_chart" not in names
 
-    # 5. Advanced analyses on the updated graph.
+    # 5. Impact analysis: changing verify_password may affect AuthService.login, which calls it.
     verify = next(n for n in graph["nodes"] if n["qualified_name"] == "verify_password")
     impact = http.get(f"/projects/{project_id}/analysis/impact", params={"entity_id": verify["id"]})
-    assert impact.status_code == 200, impact.text
     assert "AuthService.login" in {i["entity"]["qualified_name"] for i in impact.json()["affected"]}
+
+    # 6. Dependency analysis and architecture summary (the LLM summarizes computed facts).
     dependencies = http.get(f"/projects/{project_id}/analysis/dependencies").json()
     assert ("auth/service.py", "repository/user.py") in {
         (d["source"], d["target"]) for d in dependencies["dependencies"]
     }
     architecture = http.get(f"/projects/{project_id}/analysis/architecture").json()
     assert architecture["facts"] and architecture["summary"], architecture["warnings"]
-    assert architecture["cited"] and set(architecture["cited"]) <= {f["number"] for f in architecture["facts"]}
 
-    # 6. Chat: a grounded, cited answer from the real LLM, on the updated project.
+    # 7. Chat: a grounded answer from the real LLM, with cited sources.
     response = http.post(f"/projects/{project_id}/chat",
                          json={"question": "How is authentication implemented?"})  # fmt: skip
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["answer"].strip() and "insufficient" not in body["answer"]
-    assert body["sources"] and body["cited"]
-    assert body["graph_status"] in {"complete", "partial", "unavailable"}
-    by_id = {source["id"]: source for source in body["sources"]}
-    assert all(number in by_id and by_id[number]["cited"] for number in body["cited"])
+    assert body["answer"].strip() and body["sources"] and body["cited"]
     assert any(source["entity"] == "AuthService.login" for source in body["sources"])

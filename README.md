@@ -38,7 +38,7 @@ See [docs/architecture.md](docs/architecture.md) for the full architecture.
 codegraph-ai/
 ├── backend/          # FastAPI application
 │   ├── app/          # application code
-│   ├── evaluation/   # retrieval evaluation (labelled questions, script, results)
+│   ├── evaluation/   # retrieval evaluation and pipeline benchmark (scripts, results)
 │   └── tests/        # pytest tests
 ├── frontend/         # React + TypeScript + Vite application (e2e/: browser test)
 ├── docs/             # documentation
@@ -885,6 +885,32 @@ Run it (Neo4j and Qdrant started, the repository imported and analyzed):
 ```bash
 cd backend
 python -m evaluation.retrieval_eval <project_id>   # prints the table, writes results.json
+```
+
+### Pipeline benchmark
+
+How does the analysis behave on a large real codebase? `backend/evaluation/pipeline_benchmark.py`
+runs the import, parsing and graph steps on one open-source repository, with the application's
+own services, and records what Neo4j holds.
+
+Measured on [Django](https://github.com/django/django) (results in `pipeline_results.json`):
+
+| | |
+| --- | --- |
+| Source files | 3,041 (2,933 Python, 108 JavaScript), none failed to parse |
+| Graph nodes | 47,306 (3,041 files, 11,114 classes, 3,365 functions, 29,786 methods) |
+| Relationships | 122,470 (51,905 calls, 44,265 contains, 9,359 inherits, 9,179 imports...) |
+| Time | 98 s to parse and resolve, 42 s to write the graph |
+
+The embedding step is not part of this benchmark: on a CPU it would take hours for a
+repository of this size. The numbers say how much was extracted and how fast, not whether
+every relationship of the code was found: references that static analysis cannot resolve
+(libraries, dynamic calls) are counted as unresolved.
+
+```bash
+cd backend
+python -m evaluation.pipeline_benchmark                 # Django (Neo4j started)
+python -m evaluation.pipeline_benchmark <github url>    # another repository
 ```
 
 ## Configuration

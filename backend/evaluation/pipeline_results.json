@@ -1,0 +1,30 @@
+{
+  "repository": "https://github.com/django/django",
+  "commit": "1b4d021b6525bff6439b9d3b8d5388a1a1906ecd",
+  "files": 3041,
+  "languages": {
+    "javascript": 108,
+    "python": 2933
+  },
+  "failed_files": 0,
+  "entities_by_type": {
+    "class": 11114,
+    "file": 3041,
+    "function": 3365,
+    "method": 29786
+  },
+  "unresolved_references": 77802,
+  "neo4j_nodes": 47306,
+  "neo4j_relationships": 122470,
+  "neo4j_relationships_by_type": {
+    "CALLS": 51905,
+    "CONTAINS": 44265,
+    "DEPENDS_ON": 7752,
+    "IMPORTS": 9179,
+    "INHERITS": 9359,
+    "USES": 10
+  },
+  "import_seconds": 142.3,
+  "analyze_seconds": 97.5,
+  "graph_seconds": 42.2
+}
